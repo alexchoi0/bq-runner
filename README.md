@@ -1,6 +1,6 @@
 # bq-runner
 
-A BigQuery runner with three execution modes: mock (DuckDB emulation), interactive (real BigQuery with high priority), and batch (real BigQuery with queued execution).
+A BigQuery runner with three execution modes: mock (BQ emulation via DuckDB), interactive (real BigQuery with high priority), and batch (real BigQuery with queued execution).
 
 ## Features
 
