@@ -2,6 +2,10 @@
 /target/
 Cargo.lock
 
+# Editor/Tool caches
+.clj-kondo/
+.lsp/
+
 # Clojure
 /adaptors/clojure/.cpcache/
 /adaptors/clojure/.nrepl-port
