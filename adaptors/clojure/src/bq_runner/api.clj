@@ -45,9 +45,9 @@
 (defrecord Session [conn session-id])
 
 (defn connect
-  "Connect to bq-runner server."
-  [url]
-  (client/connect url))
+  "Connect to bq-runner by spawning a process with the given binary path."
+  [binary-path]
+  (client/connect binary-path))
 
 (defn close
   "Close connection. Accepts a connection or a session.
@@ -83,10 +83,10 @@
 (defmacro with-connection
   "Execute body with a connection, ensuring it's closed afterward.
 
-   (with-connection [conn \"ws://localhost:3000/ws\"]
+   (with-connection [conn \"/path/to/bq-runner\"]
      (do-stuff conn))"
-  [[binding url] & body]
-  `(let [~binding (connect ~url)]
+  [[binding binary-path] & body]
+  `(let [~binding (connect ~binary-path)]
      (try
        ~@body
        (finally

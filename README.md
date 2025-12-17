@@ -1,14 +1,14 @@
 # bq-runner
 
-A BigQuery runner with three execution modes: mock (BQ emulation via DuckDB), interactive (real BigQuery with high priority), and batch (real BigQuery with queued execution).
+A BigQuery runner with two execution modes: mock (BigQuery emulation via YachtSQL) and bigquery (real BigQuery).
 
 ## Features
 
-- **BigQuery SQL compatibility**: Transforms BigQuery SQL syntax to DuckDB (mock mode)
-- **Session isolation**: Each session gets its own schema, fully isolated
-- **DAG execution**: Register tables as a DAG and execute with parallel processing
-- **WebSocket RPC**: JSON-RPC 2.0 over WebSocket
-- **Multiple execution modes**: Mock, Interactive, and Batch
+- **Native BigQuery SQL support**: YachtSQL provides native BigQuery SQL dialect support
+- **Session isolation**: Each session gets its own database, fully isolated
+- **DAG execution**: Register tables as a DAG and execute in dependency order
+- **WebSocket & stdio RPC**: JSON-RPC 2.0 over WebSocket or stdio
+- **Multiple execution modes**: Mock (local) and BigQuery (real)
 
 ## Quick Start
 
@@ -16,32 +16,42 @@ A BigQuery runner with three execution modes: mock (BQ emulation via DuckDB), in
 # Build
 cargo build --release
 
-# Run in mock mode (default) - uses DuckDB
+# Run in mock mode (default) - uses YachtSQL
 ./target/release/bq-runner
 
-# Run in interactive mode - real BigQuery, high priority
-./target/release/bq-runner --mode interactive --project my-gcp-project
+# Run in bigquery mode - real BigQuery
+./target/release/bq-runner --mode bigquery
 
-# Run in batch mode - real BigQuery, queued execution
-./target/release/bq-runner --mode batch --project my-gcp-project
+# Run in stdio mode (for process-based IPC)
+./target/release/bq-runner --stdio
 ```
 
-Server starts on `ws://localhost:3000/ws`
+Server starts on `ws://localhost:3000/ws` (or reads from stdin in stdio mode)
 
 ## Execution Modes
 
-| Mode | Backend | Priority | Use Case |
-|------|---------|----------|----------|
-| `mock` | DuckDB | N/A | Local development, testing |
-| `interactive` | BigQuery | High | Production queries needing immediate results |
-| `batch` | BigQuery | Low | Large analytics jobs, cost optimization |
+| Mode | Backend | Use Case |
+|------|---------|----------|
+| `mock` | YachtSQL | Local development, testing |
+| `bigquery` | BigQuery | Production queries against real BigQuery |
 
 ### BigQuery Authentication
 
-For `interactive` and `batch` modes, set up authentication:
+For `bigquery` mode, set up authentication:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+```
+
+The project ID is automatically read from the credentials file.
+
+## CLI Options
+
+```
+Options:
+      --port <PORT>    Server port [default: 3000]
+      --stdio          Run in stdio mode (read JSON-RPC from stdin, write to stdout)
+      --mode <MODE>    Execution mode: mock (YachtSQL) or bigquery (real BigQuery) [default: mock]
 ```
 
 ## RPC Methods
@@ -55,25 +65,9 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
 | `bq.createTable` | Create table with schema |
 | `bq.insert` | Insert rows into table |
 | `bq.registerDag` | Register DAG of source/derived tables |
-| `bq.runDag` | Execute DAG with parallel processing |
+| `bq.runDag` | Execute DAG in dependency order |
 | `bq.getDag` | Get registered DAG tables |
 | `bq.clearDag` | Clear DAG registry |
-
-## Supported BigQuery Functions
-
-Automatically transformed to DuckDB equivalents (mock mode):
-
-- `SAFE_DIVIDE` → division with NULLIF
-- `TIMESTAMP_DIFF/ADD/SUB` → DATE_DIFF with interval
-- `FORMAT_TIMESTAMP` → strftime
-- `PARSE_TIMESTAMP` → strptime
-- `SAFE_CAST` → TRY_CAST
-- `ANY_VALUE` → ARBITRARY
-- `IFNULL` → COALESCE
-- `ARRAY_LENGTH` → LEN
-- `DATE()`, `DATETIME()` → CAST
-- `REGEXP_CONTAINS` → regexp_matches
-- `GENERATE_UUID` → uuid
 
 ## Client Adapters
 

@@ -1,36 +1,36 @@
 (ns bq-runner.client-test
   "Tests for bq-runner Clojure client.
-   Server is automatically started on first test run."
+   Each test spawns its own bq-runner process via stdio."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [bq-runner.api :as bq]
             [bq-runner.rpc :as rpc]
             [bq-runner.client :as client]
             [bq-runner.test-server :as test-server]))
 
-(def ^:dynamic *test-url* nil)
+(def ^:dynamic *binary-path* nil)
 
-(defn server-fixture [f]
-  (binding [*test-url* (test-server/ensure-server!)]
+(defn binary-fixture [f]
+  (binding [*binary-path* (test-server/get-binary-path)]
     (f)))
 
-(use-fixtures :once server-fixture)
+(use-fixtures :once binary-fixture)
 
 (deftest test-connection
   (testing "Can connect and disconnect"
-    (let [conn (client/connect *test-url*)]
+    (let [conn (client/connect *binary-path*)]
       (is (client/connected? conn))
       (client/close conn)
       (is (not (client/connected? conn))))))
 
 (deftest test-ping
   (testing "Ping returns pong"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (is (true? (bq/ping conn)))
       (is (= "pong" (:message (rpc/ping conn)))))))
 
 (deftest test-session-lifecycle
   (testing "Can create and destroy sessions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (let [result (rpc/create-session conn)]
         (is (string? (:sessionId result)))
         (is (> (count (:sessionId result)) 0))
@@ -39,14 +39,14 @@
 
 (deftest test-with-session-macro
   (testing "with-session macro works correctly"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [session conn]
         (is (some? (:session-id session)))
         (is (= conn (:conn session)))))))
 
 (deftest test-simple-query
   (testing "Can execute simple queries"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query s "SELECT 1 AS num, 'hello' AS greeting")]
           (is (= 1 (count result)))
@@ -55,7 +55,7 @@
 
 (deftest test-query-raw
   (testing "query-raw returns BigQuery format"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query-raw s "SELECT 42 AS answer")]
           (is (= "bigquery#queryResponse" (:kind result)))
@@ -65,7 +65,7 @@
 
 (deftest test-create-table-with-map-schema
   (testing "Can create table with map schema"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/create-table! s :test_users
                                        {:id :int64
@@ -75,7 +75,7 @@
 
 (deftest test-create-table-with-vector-schema
   (testing "Can create table with vector schema"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/create-table! s "products"
                                        [{:name "id" :type "INT64"}
@@ -84,7 +84,7 @@
 
 (deftest test-insert-and-query
   (testing "Can insert and query data"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :employees {:id :int64 :name :string})
         (let [insert-result (bq/insert! s :employees
@@ -99,7 +99,7 @@
 
 (deftest test-aggregation-query
   (testing "Aggregation queries work"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :sales {:amount :float64})
         (bq/insert! s :sales [[10.0] [20.0] [30.0]])
@@ -109,7 +109,7 @@
 
 (deftest test-error-handling
   (testing "SQL errors are properly propagated"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo
                               #".*"
@@ -117,21 +117,21 @@
 
 (deftest test-bigquery-syntax
   (testing "BigQuery-specific syntax works"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query s "SELECT * FROM UNNEST([1, 2, 3]) AS num")]
           (is (= 3 (count result))))))))
 
 (deftest test-struct-query
   (testing "STRUCT queries work"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query-raw s "SELECT STRUCT(1 AS x, 2 AS y) AS point")]
           (is (= 1 (count (:rows result)))))))))
 
 (deftest test-destroy-session-cleans-up-tables
   (testing "destroy-session drops all tables and views"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (let [session (bq/create-session conn)
             session-id (:session-id session)]
         (bq/create-table! session :cleanup_test {:id :int64 :name :string})
@@ -146,7 +146,7 @@
 
 (deftest test-close-with-session-cleans-up
   (testing "close with session destroys session and closes connection"
-    (let [conn (bq/connect *test-url*)
+    (let [conn (bq/connect *binary-path*)
           session (bq/create-session conn)]
       (bq/create-table! session :close_test {:x :int64})
       (bq/insert! session :close_test [[42]])

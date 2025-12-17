@@ -129,7 +129,7 @@ pub struct CreateTableParams {
     pub schema: Vec<ColumnDef>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ColumnDef {
     pub name: String,
     #[serde(rename = "type")]
@@ -157,37 +157,33 @@ pub struct InsertResult {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DagTableDef {
-    pub name: String,
-    pub sql: Option<String>,
-    pub schema: Option<Vec<DagColumnDef>>,
-    pub rows: Option<Vec<Value>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DagColumnDef {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub column_type: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct RegisterDagParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub tables: Vec<DagTableDef>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RegisterDagTableResult {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DagTableDef {
     pub name: String,
-    pub dependencies: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Vec<ColumnDef>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegisterDagResult {
     pub success: bool,
-    pub tables: Vec<RegisterDagTableResult>,
+    pub tables: Vec<DagTableInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DagTableInfo {
+    pub name: String,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,18 +208,18 @@ pub struct GetDagParams {
 }
 
 #[derive(Debug, Serialize)]
-pub struct GetDagTableInfo {
+pub struct GetDagResult {
+    pub tables: Vec<DagTableDetail>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DagTableDetail {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
     #[serde(rename = "isSource")]
     pub is_source: bool,
     pub dependencies: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GetDagResult {
-    pub tables: Vec<GetDagTableInfo>,
 }
 
 #[derive(Debug, Deserialize)]

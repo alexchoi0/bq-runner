@@ -2,11 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("DuckDB error: {0}")]
-    DuckDb(#[from] duckdb::Error),
-
-    #[error("SQL parse error: {0}")]
-    SqlParse(#[from] sqlparser::parser::ParserError),
+    #[error("Executor error: {0}")]
+    Executor(String),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -17,9 +14,6 @@ pub enum Error {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
-    #[error("SQL transformation error: {0}")]
-    SqlTransform(String),
-
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -27,12 +21,10 @@ pub enum Error {
 impl Error {
     pub fn code(&self) -> i32 {
         match self {
-            Error::DuckDb(_) => -32000,
-            Error::SqlParse(_) => -32001,
+            Error::Executor(_) => -32000,
             Error::Json(_) => -32700,
             Error::SessionNotFound(_) => -32002,
             Error::InvalidRequest(_) => -32600,
-            Error::SqlTransform(_) => -32003,
             Error::Internal(_) => -32603,
         }
     }

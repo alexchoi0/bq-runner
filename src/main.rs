@@ -3,38 +3,53 @@ use std::sync::Arc;
 
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::{Response, IntoResponse},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde_json::json;
-use tracing::{info, Level};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::{error, info, Level};
 use tracing_subscriber::EnvFilter;
 
-mod dag;
 mod error;
 mod executor;
 mod rpc;
 mod session;
-mod sql;
 
-use executor::{DuckDbExecutor, BigQueryExecutor, ExecutionMode, QueryExecutor};
-use rpc::{handle_websocket, RpcMethods};
+use executor::ExecutorMode;
+use rpc::{handle_websocket, process_message, RpcMethods};
 use session::SessionManager;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum Mode {
+    #[default]
+    Mock,
+    Bigquery,
+}
+
+impl From<Mode> for ExecutorMode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Mock => ExecutorMode::Mock,
+            Mode::Bigquery => ExecutorMode::BigQuery,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "bq-runner")]
-#[command(about = "BigQuery runner with mock, interactive, and batch modes")]
+#[command(about = "BigQuery runner with mock and real BigQuery modes")]
 struct Args {
-    #[arg(long, default_value = "mock")]
-    mode: String,
-
-    #[arg(long)]
-    project: Option<String>,
-
     #[arg(long, default_value = "3000")]
     port: u16,
+
+    #[arg(long, help = "Run in stdio mode (read JSON-RPC from stdin, write to stdout)")]
+    stdio: bool,
+
+    #[arg(long, value_enum, default_value = "mock", help = "Execution mode: mock (YachtSQL) or bigquery (real BigQuery)")]
+    mode: Mode,
 }
 
 #[derive(Clone)]
@@ -44,35 +59,69 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
-
     let args = Args::parse();
 
-    let mode: ExecutionMode = args.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-    let executor: Arc<dyn QueryExecutor> = match mode {
-        ExecutionMode::Mock => {
-            info!("Starting in mock mode (DuckDB)");
-            Arc::new(DuckDbExecutor::new()?)
-        }
-        ExecutionMode::Interactive | ExecutionMode::Batch => {
-            let project = args.project.ok_or_else(|| {
-                anyhow::anyhow!("--project is required for interactive/batch modes")
-            })?;
-            info!("Starting in {:?} mode with project: {}", mode, project);
-            Arc::new(BigQueryExecutor::new(project, mode).await?)
-        }
-    };
-
-    let session_manager = Arc::new(SessionManager::new(executor));
+    let executor_mode: ExecutorMode = args.mode.into();
+    let session_manager = Arc::new(SessionManager::with_mode(executor_mode));
     let methods = Arc::new(RpcMethods::new(session_manager));
 
+    if args.stdio {
+        run_stdio_server(methods).await
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::builder()
+                    .with_default_directive(Level::INFO.into())
+                    .from_env_lossy(),
+            )
+            .init();
+
+        match executor_mode {
+            ExecutorMode::Mock => info!("Starting in mock mode (YachtSQL)"),
+            ExecutorMode::BigQuery => info!("Starting in BigQuery mode"),
+        }
+
+        run_http_server(args.port, methods).await
+    }
+}
+
+async fn run_stdio_server(methods: Arc<RpcMethods>) -> anyhow::Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut reader = BufReader::new(stdin).lines();
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = process_message(&line, &methods).await;
+
+        match serde_json::to_string(&response) {
+            Ok(response_text) => {
+                if let Err(e) = stdout.write_all(response_text.as_bytes()).await {
+                    error!("Failed to write response: {}", e);
+                    break;
+                }
+                if let Err(e) = stdout.write_all(b"\n").await {
+                    error!("Failed to write newline: {}", e);
+                    break;
+                }
+                if let Err(e) = stdout.flush().await {
+                    error!("Failed to flush stdout: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Failed to serialize response: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_http_server(port: u16, methods: Arc<RpcMethods>) -> anyhow::Result<()> {
     let state = AppState { methods };
 
     let app = Router::new()
@@ -80,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Starting bq-runner on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -3,12 +3,15 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::dag::{ColumnDef as DagColumnDef, DagExecutor, TableKind};
 use crate::error::{Error, Result};
 use crate::session::SessionManager;
-use crate::sql::transform_bq_to_duckdb;
 
-use super::types::*;
+use super::types::{
+    ClearDagParams, ClearDagResult, CreateSessionResult, CreateTableParams, CreateTableResult,
+    DestroySessionParams, DestroySessionResult, GetDagParams, GetDagResult, InsertParams,
+    InsertResult, PingResult, QueryParams, RegisterDagParams, RegisterDagResult, RunDagParams,
+    RunDagResult,
+};
 
 pub struct RpcMethods {
     session_manager: Arc<SessionManager>,
@@ -40,11 +43,7 @@ impl RpcMethods {
     }
 
     async fn create_session(&self, _params: Value) -> Result<Value> {
-        let session_manager = Arc::clone(&self.session_manager);
-
-        let session_id = tokio::task::spawn_blocking(move || session_manager.create_session())
-            .await
-            .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
+        let session_id = self.session_manager.create_session().await?;
 
         Ok(json!(CreateSessionResult {
             session_id: session_id.to_string(),
@@ -67,16 +66,12 @@ impl RpcMethods {
     async fn query(&self, params: Value) -> Result<Value> {
         let p: QueryParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
-
-        let schema_name = self.session_manager.get_schema_name(session_id)?;
-        let transformed_sql = transform_bq_to_duckdb(&p.sql, &schema_name)?;
+        let sql = p.sql;
 
         let session_manager = Arc::clone(&self.session_manager);
 
         let result = tokio::task::spawn_blocking(move || {
-            session_manager
-                .executor()
-                .execute_query(&schema_name, &transformed_sql)
+            session_manager.execute_query(session_id, &sql)
         })
         .await
         .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
@@ -88,16 +83,14 @@ impl RpcMethods {
         let p: CreateTableParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
 
-        let schema_name = self.session_manager.get_schema_name(session_id)?;
-
         let columns: Vec<String> = p
             .schema
             .iter()
-            .map(|col| format!("\"{}\" {}", col.name, bq_type_to_duckdb(&col.column_type)))
+            .map(|col| format!("{} {}", col.name, col.column_type))
             .collect();
 
         let sql = format!(
-            "CREATE TABLE \"{}\" ({})",
+            "CREATE TABLE {} ({})",
             p.table_name,
             columns.join(", ")
         );
@@ -105,7 +98,7 @@ impl RpcMethods {
         let session_manager = Arc::clone(&self.session_manager);
 
         tokio::task::spawn_blocking(move || {
-            session_manager.executor().execute_statement(&schema_name, &sql)
+            session_manager.execute_statement(session_id, &sql)
         })
         .await
         .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
@@ -116,8 +109,6 @@ impl RpcMethods {
     async fn insert(&self, params: Value) -> Result<Value> {
         let p: InsertParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
-
-        let schema_name = self.session_manager.get_schema_name(session_id)?;
 
         if p.rows.is_empty() {
             return Ok(json!(InsertResult { inserted_rows: 0 }));
@@ -139,119 +130,61 @@ impl RpcMethods {
             })
             .collect();
 
+        let row_count = values.len() as u64;
+
         let sql = format!(
-            "INSERT INTO \"{}\" VALUES {}",
+            "INSERT INTO {} VALUES {}",
             p.table_name,
             values.join(", ")
         );
 
         let session_manager = Arc::clone(&self.session_manager);
-        let inserted = tokio::task::spawn_blocking(move || {
-            session_manager.executor().execute_statement(&schema_name, &sql)
+        tokio::task::spawn_blocking(move || {
+            session_manager.execute_statement(session_id, &sql)
         })
         .await
         .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
 
         Ok(json!(InsertResult {
-            inserted_rows: inserted,
+            inserted_rows: row_count,
         }))
     }
 
     async fn register_dag(&self, params: Value) -> Result<Value> {
         let p: RegisterDagParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
+        let tables = p.tables;
 
-        let mut results = Vec::new();
+        let session_manager = Arc::clone(&self.session_manager);
 
-        for table_def in p.tables {
-            if let Some(sql) = table_def.sql {
-                let def = self.session_manager.with_registry_mut(session_id, |registry| {
-                    registry.register_derived(table_def.name.clone(), sql)
-                })??;
-
-                results.push(RegisterDagTableResult {
-                    name: def.name.clone(),
-                    dependencies: def.dependencies(),
-                });
-            } else if let (Some(schema), Some(rows)) = (table_def.schema, table_def.rows) {
-                let dag_schema: Vec<DagColumnDef> = schema
-                    .into_iter()
-                    .map(|c| DagColumnDef {
-                        name: c.name,
-                        column_type: c.column_type,
-                    })
-                    .collect();
-
-                let rows_data: Vec<Vec<Value>> = rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        if let Value::Array(arr) = row {
-                            Some(arr)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                let def = self.session_manager.with_registry_mut(session_id, |registry| {
-                    registry.register_source(table_def.name.clone(), dag_schema, rows_data)
-                })??;
-
-                results.push(RegisterDagTableResult {
-                    name: def.name.clone(),
-                    dependencies: def.dependencies(),
-                });
-            } else {
-                return Err(Error::InvalidRequest(
-                    "Table must have either sql or schema+rows".to_string(),
-                ));
-            }
-        }
-
-        let schema_name = self.session_manager.get_schema_name(session_id)?;
-        let executor = self.session_manager.executor();
-        self.session_manager.with_registry(session_id, |registry| {
-            registry.validate_dependencies(executor, &schema_name)
-        })??;
+        let table_infos = tokio::task::spawn_blocking(move || {
+            session_manager.register_dag(session_id, tables)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
 
         Ok(json!(RegisterDagResult {
             success: true,
-            tables: results,
+            tables: table_infos,
         }))
     }
 
     async fn run_dag(&self, params: Value) -> Result<Value> {
         let p: RunDagParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
+        let targets = p.table_names;
 
-        let schema_name = self.session_manager.get_schema_name(session_id)?;
-        let executor = self.session_manager.arc_executor();
+        let session_manager = Arc::clone(&self.session_manager);
 
-        let registry_snapshot = self.session_manager.with_registry(session_id, |registry| {
-            registry.all().into_iter().cloned().collect::<Vec<_>>()
-        })?;
-
-        let mut temp_registry = crate::dag::TableRegistry::new();
-        for def in registry_snapshot {
-            match &def.kind {
-                TableKind::Derived { sql, .. } => {
-                    temp_registry.register_derived(def.name.clone(), sql.clone())?;
-                }
-                TableKind::Source { schema, rows } => {
-                    temp_registry.register_source(def.name.clone(), schema.clone(), rows.clone())?;
-                }
-            }
-        }
-
-        let dag_executor = DagExecutor::new();
-        let targets = p.table_names.unwrap_or_default();
-        let result = dag_executor
-            .run(&temp_registry, &targets, executor, &schema_name)
-            .await?;
+        let executed = tokio::task::spawn_blocking(move || {
+            session_manager.run_dag(session_id, targets)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
 
         Ok(json!(RunDagResult {
             success: true,
-            executed_tables: result.executed_tables,
+            executed_tables: executed,
         }))
     }
 
@@ -259,24 +192,13 @@ impl RpcMethods {
         let p: GetDagParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
 
-        let tables = self.session_manager.with_registry(session_id, |registry| {
-            registry
-                .all()
-                .iter()
-                .map(|def| {
-                    let (sql, is_source) = match &def.kind {
-                        TableKind::Source { .. } => (None, true),
-                        TableKind::Derived { sql, .. } => (Some(sql.clone()), false),
-                    };
-                    GetDagTableInfo {
-                        name: def.name.clone(),
-                        sql,
-                        is_source,
-                        dependencies: def.dependencies(),
-                    }
-                })
-                .collect::<Vec<_>>()
-        })?;
+        let session_manager = Arc::clone(&self.session_manager);
+
+        let tables = tokio::task::spawn_blocking(move || {
+            session_manager.get_dag(session_id)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
 
         Ok(json!(GetDagResult { tables }))
     }
@@ -285,9 +207,13 @@ impl RpcMethods {
         let p: ClearDagParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
 
-        self.session_manager.with_registry_mut(session_id, |registry| {
-            registry.clear();
-        })?;
+        let session_manager = Arc::clone(&self.session_manager);
+
+        tokio::task::spawn_blocking(move || {
+            session_manager.clear_dag(session_id)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {e}")))??;
 
         Ok(json!(ClearDagResult { success: true }))
     }
@@ -295,24 +221,6 @@ impl RpcMethods {
 
 fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|_| Error::InvalidRequest(format!("Invalid session ID: {}", s)))
-}
-
-fn bq_type_to_duckdb(bq_type: &str) -> &str {
-    match bq_type.to_uppercase().as_str() {
-        "STRING" => "VARCHAR",
-        "INT64" | "INTEGER" => "BIGINT",
-        "FLOAT64" | "FLOAT" => "DOUBLE",
-        "BOOL" | "BOOLEAN" => "BOOLEAN",
-        "BYTES" => "BLOB",
-        "DATE" => "DATE",
-        "DATETIME" => "TIMESTAMP",
-        "TIME" => "TIME",
-        "TIMESTAMP" => "TIMESTAMPTZ",
-        "NUMERIC" | "BIGNUMERIC" => "DECIMAL",
-        "GEOGRAPHY" => "VARCHAR",
-        "JSON" => "JSON",
-        _ => "VARCHAR",
-    }
 }
 
 fn json_to_sql_value(val: &Value) -> String {
