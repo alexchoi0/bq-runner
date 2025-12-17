@@ -140,11 +140,18 @@ Register a DAG of tables and execute with parallel processing:
 ## Testing
 
 ```bash
-# Start server first
-cd ../.. && cargo build --release && ./target/release/bq-runner &
+# Run E2E tests (starts server container automatically)
+./e2e.sh
+
+# Or manually:
+# Start server via container
+cd ../.. && podman compose up -d
 
 # Run tests
 clojure -M:test
+
+# Stop server
+podman compose down
 ```
 
 ## License

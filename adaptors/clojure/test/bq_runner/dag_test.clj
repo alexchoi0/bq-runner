@@ -5,17 +5,17 @@
             [bq-runner.rpc :as rpc]
             [bq-runner.test-server :as test-server]))
 
-(def ^:dynamic *test-url* nil)
+(def ^:dynamic *binary-path* nil)
 
-(defn server-fixture [f]
-  (binding [*test-url* (test-server/ensure-server!)]
+(defn binary-fixture [f]
+  (binding [*binary-path* (test-server/get-binary-path)]
     (f)))
 
-(use-fixtures :once server-fixture)
+(use-fixtures :once binary-fixture)
 
 (deftest test-register-dag-source-table
   (testing "Can register a source table"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/register-dag! s
                        [{:name :users
@@ -28,7 +28,7 @@
 
 (deftest test-register-dag-derived-table
   (testing "Can register a derived table with inferred dependencies"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/register-dag! s
                        [{:name :users
@@ -43,7 +43,7 @@
 
 (deftest test-run-dag-simple
   (testing "Can run a simple DAG and query results"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :source_data
@@ -61,7 +61,7 @@
 
 (deftest test-run-dag-with-target
   (testing "Can run DAG for specific target table"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :a :schema {:x :int64} :rows [[1]]}
@@ -77,7 +77,7 @@
 
 (deftest test-dag-chain
   (testing "DAG with chained dependencies executes in correct order"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :raw
@@ -95,7 +95,7 @@
 
 (deftest test-dag-diamond
   (testing "Diamond-shaped DAG (A -> B,C -> D) works correctly"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :source
@@ -113,7 +113,7 @@
 
 (deftest test-get-dag
   (testing "get-dag returns registered tables"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :src :schema {:x :int64} :rows [[1]]}
@@ -129,7 +129,7 @@
 
 (deftest test-clear-dag
   (testing "clear-dag removes all registered tables"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :a :schema {:x :int64} :rows [[1]]}
@@ -140,7 +140,7 @@
 
 (deftest test-dag-aggregation
   (testing "DAG with aggregation functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :sales
@@ -156,7 +156,7 @@
 
 (deftest test-dag-join
   (testing "DAG with JOIN operations"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :customers
@@ -175,7 +175,7 @@
 
 (deftest test-dag-cte
   (testing "DAG with CTE in derived table"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :numbers
@@ -190,7 +190,7 @@
 
 (deftest test-dag-window-functions
   (testing "DAG with window functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :employees
@@ -206,7 +206,7 @@
 
 (deftest test-dag-multiple-source-tables
   (testing "DAG with multiple independent source tables"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :products
@@ -225,7 +225,7 @@
 
 (deftest test-dag-empty-source
   (testing "DAG with empty source table"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :empty_source
@@ -239,7 +239,7 @@
 
 (deftest test-dag-reregister
   (testing "Re-registering DAG accumulates rows; use clear-dag! to replace"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :data :schema {:x :int64} :rows [[1]]}])
@@ -259,7 +259,7 @@
 
 (deftest test-dag-complex-pipeline
   (testing "Complex DAG pipeline with multiple transformations"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/register-dag! s
           [{:name :events

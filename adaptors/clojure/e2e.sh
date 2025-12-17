@@ -3,30 +3,21 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SERVER_PID=""
+CONTAINER_NAME="bq-runner"
 
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        echo "Stopping server (PID: $SERVER_PID)..."
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-    fi
+    echo "Stopping container..."
+    podman compose -f "$PROJECT_ROOT/compose.yaml" down 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "=== bq-runner E2E Tests ==="
 echo
 
-# Build server
-echo "Building server..."
+# Start server via podman-compose
+echo "Starting server container..."
 cd "$PROJECT_ROOT"
-cargo build --release
-echo "  Build successful"
-
-# Start server
-echo "Starting server..."
-./target/release/bq-runner &
-SERVER_PID=$!
+podman compose up -d --build
 
 # Wait for server to be ready
 echo "Waiting for server..."
@@ -37,6 +28,7 @@ for i in {1..50}; do
     fi
     if [ $i -eq 50 ]; then
         echo "  Timeout waiting for server"
+        podman compose logs
         exit 1
     fi
     sleep 0.2

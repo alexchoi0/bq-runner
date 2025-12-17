@@ -1,12 +1,20 @@
 (ns bq-runner.client
-  "WebSocket connection management for bq-runner using Java 11+ interop"
+  "Process-based connection management for bq-runner using stdio"
   (:require [clojure.data.json :as json])
-  (:import [java.net URI]
-           [java.net.http HttpClient WebSocket WebSocket$Listener]
-           [java.util.concurrent LinkedBlockingQueue TimeUnit CompletableFuture]
-           [java.nio CharBuffer]))
+  (:import [java.io BufferedReader InputStreamReader PrintWriter]
+           [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
-(defrecord Connection [^WebSocket ws pending-responses closed? message-buffer])
+(defprotocol IConnection
+  (send-request* [conn method params timeout-ms])
+  (close* [conn])
+  (connected?* [conn]))
+
+(defrecord ProcessConnection [^Process process
+                              ^BufferedReader reader
+                              ^PrintWriter writer
+                              pending-responses
+                              closed?
+                              reader-thread])
 
 (defn- generate-id []
   (str (java.util.UUID/randomUUID)))
@@ -17,64 +25,55 @@
    :params params
    :id (generate-id)})
 
-(defn- handle-message [conn msg]
-  (let [pending (:pending-responses conn)
-        response (json/read-str msg :key-fn keyword)
-        id (:id response)]
-    (when-let [queue (get @pending id)]
-      (.put ^LinkedBlockingQueue queue response)
-      (swap! pending dissoc id))))
+(defn- start-reader-thread [conn]
+  (let [reader (:reader conn)
+        pending (:pending-responses conn)
+        closed? (:closed? conn)]
+    (doto (Thread.
+           (fn []
+             (try
+               (loop []
+                 (when-not @closed?
+                   (when-let [line (.readLine reader)]
+                     (let [response (json/read-str line :key-fn keyword)
+                           id (:id response)]
+                       (when-let [queue (get @pending id)]
+                         (.put ^LinkedBlockingQueue queue response)
+                         (swap! pending dissoc id)))
+                     (recur))))
+               (catch Exception _
+                 (reset! closed? true)))))
+      (.setDaemon true)
+      (.start))))
 
 (defn connect
-  "Connect to bq-runner WebSocket server.
-   Returns a Connection record."
-  [url]
-  (let [pending (atom {})
+  "Connect to bq-runner by spawning a process with --stdio flag.
+   binary-path: path to the bq-runner binary"
+  [binary-path]
+  (let [process-builder (ProcessBuilder. [binary-path "--stdio"])
+        _ (.redirectErrorStream process-builder false)
+        process (.start process-builder)
+        stdin (.getOutputStream process)
+        stdout (.getInputStream process)
+        reader (BufferedReader. (InputStreamReader. stdout))
+        writer (PrintWriter. stdin true)
+        pending (atom {})
         closed? (atom false)
-        message-buffer (atom (StringBuilder.))
-        conn-atom (atom nil)
-        connected-future (CompletableFuture.)
-        client (HttpClient/newHttpClient)
-        listener (reify WebSocket$Listener
-                   (onOpen [_ ws]
-                     (.request ws 1)
-                     (.complete connected-future true))
-                   (onText [_ ws data last?]
-                     (.append ^StringBuilder @message-buffer (.toString data))
-                     (when last?
-                       (let [msg (.toString ^StringBuilder @message-buffer)]
-                         (.setLength ^StringBuilder @message-buffer 0)
-                         (when-let [c @conn-atom]
-                           (handle-message c msg))))
-                     (.request ws 1)
-                     nil)
-                   (onClose [_ ws status reason]
-                     (reset! closed? true)
-                     nil)
-                   (onError [_ ws error]
-                     (reset! closed? true)
-                     (when-not (.isDone connected-future)
-                       (.completeExceptionally connected-future error))
-                     nil))
-        ws-future (-> client
-                      (.newWebSocketBuilder)
-                      (.buildAsync (URI. url) listener))]
-    (let [ws (.get ws-future 10 TimeUnit/SECONDS)]
-      (.get connected-future 5 TimeUnit/SECONDS)
-      (let [conn (->Connection ws pending closed? message-buffer)]
-        (reset! conn-atom conn)
-        conn))))
+        conn (->ProcessConnection process reader writer pending closed? nil)
+        reader-thread (start-reader-thread conn)]
+    (assoc conn :reader-thread reader-thread)))
 
 (defn close
-  "Close the WebSocket connection."
+  "Close the process connection."
   [conn]
   (reset! (:closed? conn) true)
-  (.sendClose ^WebSocket (:ws conn) WebSocket/NORMAL_CLOSURE ""))
+  (.destroy ^Process (:process conn)))
 
 (defn connected?
   "Check if connection is still open."
   [conn]
-  (not @(:closed? conn)))
+  (and (not @(:closed? conn))
+       (.isAlive ^Process (:process conn))))
 
 (defn send-request
   "Send a JSON-RPC request and wait for response.
@@ -86,12 +85,13 @@
      (throw (ex-info "Connection is closed" {:method method})))
    (let [request (make-request method params)
          id (:id request)
-         queue (LinkedBlockingQueue. 1)]
+         queue (LinkedBlockingQueue. 1)
+         writer ^PrintWriter (:writer conn)]
      (swap! (:pending-responses conn) assoc id queue)
      (try
-       (-> ^WebSocket (:ws conn)
-           (.sendText (json/write-str request) true)
-           (.get 5 TimeUnit/SECONDS))
+       (locking writer
+         (.println writer (json/write-str request))
+         (.flush writer))
        (if-let [response (.poll queue timeout-ms TimeUnit/MILLISECONDS)]
          (if-let [error (:error response)]
            (throw (ex-info (:message error)

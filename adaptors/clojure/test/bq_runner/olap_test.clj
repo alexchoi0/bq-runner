@@ -4,19 +4,19 @@
             [bq-runner.api :as bq]
             [bq-runner.test-server :as test-server]))
 
-(def ^:dynamic *test-url* nil)
+(def ^:dynamic *binary-path* nil)
 
-(defn server-fixture [f]
-  (binding [*test-url* (test-server/ensure-server!)]
+(defn binary-fixture [f]
+  (binding [*binary-path* (test-server/get-binary-path)]
     (f)))
 
-(use-fixtures :once server-fixture)
+(use-fixtures :once binary-fixture)
 
 ;; Window Functions
 
 (deftest test-row-number
   (testing "ROW_NUMBER window function"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :sales {:region :string :amount :float64})
         (bq/insert! s :sales [["East" 100.0] ["East" 200.0] ["West" 150.0] ["West" 300.0]])
@@ -29,7 +29,7 @@
 
 (deftest test-rank-dense-rank
   (testing "RANK and DENSE_RANK window functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :scores {:name :string :score :int64})
         (bq/insert! s :scores [["Alice" 100] ["Bob" 100] ["Charlie" 90] ["Dave" 80]])
@@ -42,7 +42,7 @@
 
 (deftest test-lead-lag
   (testing "LEAD and LAG window functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :timeseries {:day :int64 :value :float64})
         (bq/insert! s :timeseries [[1 10.0] [2 20.0] [3 15.0] [4 25.0]])
@@ -55,7 +55,7 @@
 
 (deftest test-running-totals
   (testing "Running totals with SUM OVER"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :transactions {:id :int64 :amount :float64})
         (bq/insert! s :transactions [[1 100.0] [2 50.0] [3 75.0] [4 25.0]])
@@ -70,7 +70,7 @@
 
 (deftest test-simple-cte
   (testing "Simple CTE"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :nums {:n :int64})
         (bq/insert! s :nums [[1] [2] [3] [4] [5]])
@@ -79,7 +79,7 @@
 
 (deftest test-chained-ctes
   (testing "Chained CTEs"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :orders {:customer_id :int64 :amount :float64})
         (bq/insert! s :orders [[1 100.0] [1 200.0] [2 150.0] [2 50.0] [3 300.0]])
@@ -102,7 +102,7 @@
 
 (deftest test-group-by-aggregations
   (testing "GROUP BY with multiple aggregations"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :products {:category :string :subcategory :string :revenue :float64})
         (bq/insert! s :products [["Electronics" "Phones" 1000.0]
@@ -116,7 +116,7 @@
 
 (deftest test-having-clause
   (testing "HAVING clause"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :events {:user_id :int64 :event_type :string})
         (bq/insert! s :events [[1 "click"] [1 "click"] [1 "view"] [2 "click"] [3 "click"] [3 "click"] [3 "click"]])
@@ -129,7 +129,7 @@
 
 (deftest test-unnest-array
   (testing "Array data via table"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :letters {:letter :string})
         (bq/insert! s :letters [["a"] ["b"] ["c"]])
@@ -138,7 +138,7 @@
 
 (deftest test-unnest-integers
   (testing "UNNEST with integer array"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :int_arr {:n :int64})
         (bq/insert! s :int_arr [[1] [2] [3]])
@@ -147,7 +147,7 @@
 
 (deftest test-cross-join
   (testing "CROSS JOIN"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :users {:id :int64 :name :string})
         (bq/create-table! s :tags {:tag :string})
@@ -164,7 +164,7 @@
 
 (deftest test-scalar-subquery
   (testing "Scalar subquery"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :employees {:id :int64 :salary :float64})
         (bq/insert! s :employees [[1 50000.0] [2 60000.0] [3 70000.0] [4 80000.0]])
@@ -177,7 +177,7 @@
 
 (deftest test-correlated-subquery
   (testing "EXISTS with correlated subquery"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :customers {:id :int64 :name :string})
         (bq/create-table! s :purchases {:customer_id :int64 :product :string})
@@ -190,7 +190,7 @@
 
 (deftest test-multiple-joins
   (testing "Multiple JOINs"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :departments {:id :int64 :name :string})
         (bq/create-table! s :staff {:id :int64 :name :string :dept_id :int64})
@@ -213,7 +213,7 @@
 
 (deftest test-case-when
   (testing "CASE WHEN expressions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :metrics {:value :int64})
         (bq/insert! s :metrics [[10] [50] [75] [100]])
@@ -235,30 +235,30 @@
 
 (deftest test-date-functions
   (testing "Date extraction functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query s "SELECT EXTRACT(YEAR FROM DATE '2024-06-15') as year, EXTRACT(MONTH FROM DATE '2024-06-15') as month, EXTRACT(DAY FROM DATE '2024-06-15') as day")]
           (is (= [{:year 2024 :month 6 :day 15}] result)))))))
 
 (deftest test-date-arithmetic
   (testing "Date arithmetic"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
-        (let [result (bq/query s "SELECT CAST(DATE_ADD(DATE '2024-01-15', INTERVAL 10 DAY) AS VARCHAR) as future_date")]
-          (is (= [{:future_date "2024-01-25 00:00:00"}] result)))))))
+        (let [result (bq/query s "SELECT CAST(DATE_ADD(DATE '2024-01-15', INTERVAL 10 DAY) AS STRING) as future_date")]
+          (is (= [{:future_date "2024-01-25"}] result)))))))
 
 ;; String functions
 
 (deftest test-string-functions
   (testing "String manipulation functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query s "SELECT UPPER('hello') as upper_str, LOWER('WORLD') as lower_str, CONCAT('foo', 'bar') as concat_str, LENGTH('test') as str_len")]
           (is (= [{:upper_str "HELLO" :lower_str "world" :concat_str "foobar" :str_len 4}] result)))))))
 
 (deftest test-regexp-functions
   (testing "Regular expression functions"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (let [result (bq/query s "SELECT REGEXP_CONTAINS('hello123', '[0-9]+') as has_digits")]
           (is (= [{:has_digits true}] result)))))))
@@ -267,7 +267,7 @@
 
 (deftest test-percentile
   (testing "Percentile calculations"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :response_times {:ms :float64})
         (bq/insert! s :response_times [[10.0] [20.0] [30.0] [40.0] [50.0] [60.0] [70.0] [80.0] [90.0] [100.0]])
@@ -276,7 +276,7 @@
 
 (deftest test-ntile
   (testing "NTILE window function for quartiles"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :values {:v :int64})
         (bq/insert! s :values [[1] [2] [3] [4] [5] [6] [7] [8]])
@@ -295,7 +295,7 @@
 
 (deftest test-cohort-analysis
   (testing "Cohort-style analysis"
-    (bq/with-connection [conn *test-url*]
+    (bq/with-connection [conn *binary-path*]
       (bq/with-session [s conn]
         (bq/create-table! s :user_events {:user_id :int64 :event_date :string :event_type :string})
         (bq/insert! s :user_events [[1 "2024-01-01" "signup"]

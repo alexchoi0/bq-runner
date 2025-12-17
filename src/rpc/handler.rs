@@ -42,7 +42,7 @@ pub async fn handle_websocket(socket: WebSocket, methods: Arc<RpcMethods>) {
     }
 }
 
-async fn process_message(msg: &str, methods: &RpcMethods) -> RpcResponse {
+pub async fn process_message(msg: &str, methods: &RpcMethods) -> RpcResponse {
     let request: RpcRequest = match serde_json::from_str(msg) {
         Ok(req) => req,
         Err(_) => return RpcResponse::parse_error(),
