@@ -47,10 +47,10 @@
       (.start))))
 
 (defn connect
-  "Connect to bq-runner by spawning a process with --stdio flag.
+  "Connect to bq-runner by spawning a process with --transport stdio flag.
    binary-path: path to the bq-runner binary"
   [binary-path]
-  (let [process-builder (ProcessBuilder. [binary-path "--stdio"])
+  (let [process-builder (ProcessBuilder. [binary-path "--transport" "stdio"])
         _ (.redirectErrorStream process-builder false)
         process (.start process-builder)
         stdin (.getOutputStream process)
