@@ -35,10 +35,6 @@ pub struct TableError {
 }
 
 impl DagRunResult {
-    pub fn has_failures(&self) -> bool {
-        !self.failed.is_empty()
-    }
-
     pub fn all_succeeded(&self) -> bool {
         self.failed.is_empty() && self.skipped.is_empty()
     }
@@ -48,11 +44,14 @@ pub struct Dag {
     tables: HashMap<String, DagTable>,
 }
 
+const DEFAULT_MAX_CONCURRENCY: usize = 8;
+
 struct StreamState {
     pending_deps: HashMap<String, HashSet<String>>,
     completed: HashSet<String>,
     blocked: HashSet<String>,
     in_flight: HashSet<String>,
+    max_concurrency: usize,
 }
 
 impl StreamState {
@@ -90,9 +89,15 @@ impl StreamState {
     }
 
     fn ready_tables(&self) -> Vec<String> {
+        let available_slots = self.max_concurrency.saturating_sub(self.in_flight.len());
+        if available_slots == 0 {
+            return vec![];
+        }
+
         self.pending_deps
             .keys()
             .filter(|name| self.is_ready(name))
+            .take(available_slots)
             .cloned()
             .collect()
     }
@@ -268,11 +273,17 @@ impl Dag {
             })
             .collect();
 
+        let max_concurrency = std::env::var("BQ_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
+
         let state = Arc::new(Mutex::new(StreamState {
             pending_deps,
             completed: HashSet::new(),
             blocked: HashSet::new(),
             in_flight: HashSet::new(),
+            max_concurrency,
         }));
 
         let (tx, rx) = mpsc::channel::<(String, Result<()>)>();
@@ -500,24 +511,11 @@ fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
         })?;
 
         if !query_result.columns.is_empty() {
-            let column_types: Vec<String> = if !query_result.rows.is_empty() {
-                query_result
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let sample_value = &query_result.rows[0][i];
-                        let inferred_type = infer_sql_type(sample_value);
-                        format!("{} {}", name, inferred_type)
-                    })
-                    .collect()
-            } else {
-                query_result
-                    .columns
-                    .iter()
-                    .map(|c| format!("{} STRING", c))
-                    .collect()
-            };
+            let column_types: Vec<String> = query_result
+                .columns
+                .iter()
+                .map(|col| format!("{} {}", col.name, col.data_type))
+                .collect();
 
             let create_sql = format!(
                 "CREATE TABLE {} ({})",
@@ -591,31 +589,19 @@ fn create_source_table_standalone(executor: &Executor, table: &DagTable) -> Resu
 }
 
 fn extract_dependencies(sql: &str, known_tables: &HashMap<String, DagTable>) -> Vec<String> {
+    let cte_names = extract_cte_names(sql);
     let mut deps = Vec::new();
     let sql_upper = sql.to_uppercase();
 
     for table_name in known_tables.keys() {
         let name_upper = table_name.to_uppercase();
-        let patterns = [
-            format!("FROM {}", name_upper),
-            format!("JOIN {}", name_upper),
-            format!("FROM {} ", name_upper),
-            format!("JOIN {} ", name_upper),
-            format!("FROM {}\n", name_upper),
-            format!("JOIN {}\n", name_upper),
-            format!("FROM {},", name_upper),
-            format!("FROM {}", name_upper),
-            format!(", {}", name_upper),
-            format!(", {} ", name_upper),
-        ];
 
-        for pattern in &patterns {
-            if sql_upper.contains(pattern) {
-                if !deps.contains(table_name) {
-                    deps.push(table_name.clone());
-                }
-                break;
-            }
+        if cte_names.contains(&name_upper) {
+            continue;
+        }
+
+        if is_table_referenced(&sql_upper, &name_upper) && !deps.contains(table_name) {
+            deps.push(table_name.clone());
         }
     }
 
@@ -623,22 +609,115 @@ fn extract_dependencies(sql: &str, known_tables: &HashMap<String, DagTable>) -> 
     deps
 }
 
-fn infer_sql_type(val: &Value) -> &'static str {
-    match val {
-        Value::Null => "STRING",
-        Value::Bool(_) => "BOOL",
-        Value::Number(n) => {
-            if n.is_i64() {
-                "INT64"
-            } else {
-                "FLOAT64"
+fn extract_cte_names(sql: &str) -> HashSet<String> {
+    let mut cte_names = HashSet::new();
+    let sql_upper = sql.to_uppercase();
+
+    let Some(with_pos) = sql_upper.find("WITH ") else {
+        return cte_names;
+    };
+
+    let mut sql_after_with = &sql_upper[with_pos + 5..];
+    let trimmed = sql_after_with.trim_start();
+    if trimmed.starts_with("RECURSIVE ") {
+        sql_after_with = &trimmed[10..];
+    }
+
+    let mut in_parens = 0;
+    let mut current_pos = 0;
+    let mut looking_for_name = true;
+    let chars: Vec<char> = sql_after_with.chars().collect();
+
+    while current_pos < chars.len() {
+        let ch = chars[current_pos];
+
+        if looking_for_name {
+            while current_pos < chars.len() && chars[current_pos].is_whitespace() {
+                current_pos += 1;
+            }
+            if current_pos >= chars.len() {
+                break;
+            }
+
+            let start = current_pos;
+            while current_pos < chars.len()
+                && (chars[current_pos].is_alphanumeric() || chars[current_pos] == '_')
+            {
+                current_pos += 1;
+            }
+
+            if current_pos > start {
+                let name: String = chars[start..current_pos].iter().collect();
+                cte_names.insert(name);
+            }
+
+            looking_for_name = false;
+            continue;
+        }
+
+        match ch {
+            '(' => in_parens += 1,
+            ')' => in_parens -= 1,
+            ',' if in_parens == 0 => {
+                looking_for_name = true;
+            }
+            _ => {}
+        }
+
+        if in_parens == 0 {
+            let remaining: String = chars[current_pos..].iter().collect();
+            let trimmed = remaining.trim_start();
+
+            if trimmed.starts_with("SELECT")
+                || trimmed.starts_with("INSERT")
+                || trimmed.starts_with("UPDATE")
+                || trimmed.starts_with("DELETE")
+            {
+                break;
             }
         }
-        Value::String(_) => "STRING",
-        Value::Array(_) => "JSON",
-        Value::Object(_) => "JSON",
+
+        current_pos += 1;
     }
+
+    cte_names
 }
+
+fn is_table_referenced(sql_upper: &str, table_name_upper: &str) -> bool {
+    let patterns = [
+        format!("FROM {}", table_name_upper),
+        format!("JOIN {}", table_name_upper),
+        format!(", {}", table_name_upper),
+    ];
+
+    for pattern in &patterns {
+        if let Some(pos) = sql_upper.find(pattern.as_str()) {
+            let after_pos = pos + pattern.len();
+            if after_pos >= sql_upper.len() {
+                return true;
+            }
+            let next_char = sql_upper.chars().nth(after_pos).unwrap_or(' ');
+            if !next_char.is_alphanumeric() && next_char != '_' {
+                return true;
+            }
+        }
+    }
+
+    let qualified_patterns = [
+        format!("FROM {}.{}", table_name_upper, ""),
+        format!("JOIN {}.{}", table_name_upper, ""),
+    ];
+
+    for pattern in &qualified_patterns {
+        let base = pattern.trim_end_matches('.');
+        if sql_upper.contains(&format!("{}.", base)) {
+            return false;
+        }
+    }
+
+    false
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1084,7 +1163,8 @@ mod tests {
             .execute_query("SELECT * FROM empty_table")
             .unwrap();
         assert_eq!(result.rows.len(), 0);
-        assert_eq!(result.columns, vec!["id", "value"]);
+        let column_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(column_names, vec!["id", "value"]);
     }
 
     #[test]
@@ -1845,5 +1925,129 @@ mod tests {
         assert_eq!(result.failed[0].table, "right_bad");
         assert_eq!(result.skipped.len(), 1);
         assert!(result.skipped.contains(&"merged".to_string()));
+    }
+
+    #[test]
+    fn test_cte_not_detected_as_dependency() {
+        let mut dag = Dag::new();
+
+        dag.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
+            .unwrap();
+
+        dag.register(vec![source_table("cte_alias", vec![("v", "INT64")], vec![])])
+            .unwrap();
+
+        let result = dag
+            .register(vec![computed_table(
+                "derived",
+                "WITH cte_alias AS (SELECT v FROM real_table) SELECT * FROM cte_alias",
+            )])
+            .unwrap();
+
+        assert_eq!(result[0].dependencies, vec!["real_table"]);
+        assert!(!result[0].dependencies.contains(&"cte_alias".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_ctes_not_detected_as_dependencies() {
+        let mut dag = Dag::new();
+
+        dag.register(vec![source_table("base", vec![("v", "INT64")], vec![])])
+            .unwrap();
+
+        dag.register(vec![
+            source_table("first", vec![("v", "INT64")], vec![]),
+            source_table("second", vec![("v", "INT64")], vec![]),
+        ])
+            .unwrap();
+
+        let result = dag
+            .register(vec![computed_table(
+                "derived",
+                "WITH first AS (SELECT 1 AS v), second AS (SELECT 2 AS v) SELECT * FROM first, second, base",
+            )])
+            .unwrap();
+
+        assert_eq!(result[0].dependencies, vec!["base"]);
+    }
+
+    #[test]
+    fn test_table_name_prefix_not_matched() {
+        let mut dag = Dag::new();
+
+        dag.register(vec![source_table("user", vec![("id", "INT64")], vec![])])
+            .unwrap();
+
+        dag.register(vec![source_table("users", vec![("id", "INT64")], vec![])])
+            .unwrap();
+
+        let result = dag
+            .register(vec![computed_table(
+                "derived",
+                "SELECT * FROM users",
+            )])
+            .unwrap();
+
+        assert_eq!(result[0].dependencies, vec!["users"]);
+        assert!(!result[0].dependencies.contains(&"user".to_string()));
+    }
+
+    #[test]
+    fn test_cte_with_recursive() {
+        let mut dag = Dag::new();
+
+        dag.register(vec![source_table("nums", vec![("n", "INT64")], vec![])])
+            .unwrap();
+
+        dag.register(vec![source_table("seq", vec![("n", "INT64")], vec![])])
+            .unwrap();
+
+        let result = dag
+            .register(vec![computed_table(
+                "derived",
+                "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM seq WHERE n < 10) SELECT * FROM seq, nums",
+            )])
+            .unwrap();
+
+        assert_eq!(result[0].dependencies, vec!["nums"]);
+        assert!(!result[0].dependencies.contains(&"seq".to_string()));
+    }
+
+    #[test]
+    fn test_subquery_alias_not_detected() {
+        let mut dag = Dag::new();
+
+        dag.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
+            .unwrap();
+
+        let result = dag
+            .register(vec![computed_table(
+                "derived",
+                "SELECT * FROM (SELECT v FROM real_table) AS sub",
+            )])
+            .unwrap();
+
+        assert_eq!(result[0].dependencies, vec!["real_table"]);
+    }
+
+    #[test]
+    fn test_extract_cte_names_function() {
+        let ctes = extract_cte_names("WITH foo AS (SELECT 1), bar AS (SELECT 2) SELECT * FROM foo, bar");
+        assert!(ctes.contains("FOO"));
+        assert!(ctes.contains("BAR"));
+        assert_eq!(ctes.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_cte_names_nested_parens() {
+        let ctes = extract_cte_names("WITH complex AS (SELECT COUNT(*) FROM (SELECT 1)) SELECT * FROM complex");
+        assert!(ctes.contains("COMPLEX"));
+        assert_eq!(ctes.len(), 1);
+    }
+
+    #[test]
+    fn test_no_cte() {
+        let ctes = extract_cte_names("SELECT * FROM users");
+        assert!(ctes.is_empty());
     }
 }

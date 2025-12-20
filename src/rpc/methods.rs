@@ -8,11 +8,12 @@ use crate::session::SessionManager;
 use crate::utils::json_to_sql_value;
 
 use super::types::{
-    ClearDagParams, ClearDagResult, CreateSessionResult, CreateTableParams, CreateTableResult,
-    DestroySessionParams, DestroySessionResult, GetDagParams, GetDagResult, InsertParams,
-    InsertResult, LoadParquetParams, LoadParquetResult, PingResult, QueryParams,
+    ClearDagParams, ClearDagResult, ColumnDef, CreateSessionResult, CreateTableParams,
+    CreateTableResult, DescribeTableParams, DescribeTableResult, DestroySessionParams,
+    DestroySessionResult, GetDagParams, GetDagResult, InsertParams, InsertResult, ListTablesParams,
+    ListTablesResult, LoadParquetParams, LoadParquetResult, PingResult, QueryParams,
     RegisterDagParams, RegisterDagResult, RetryDagParams, RunDagParams, RunDagResult,
-    TableErrorInfo,
+    TableErrorInfo, TableInfo,
 };
 
 pub struct RpcMethods {
@@ -38,6 +39,8 @@ impl RpcMethods {
             "bq.getDag" => self.get_dag(params).await,
             "bq.clearDag" => self.clear_dag(params).await,
             "bq.loadParquet" => self.load_parquet(params).await,
+            "bq.listTables" => self.list_tables(params).await,
+            "bq.describeTable" => self.describe_table(params).await,
             _ => Err(Error::InvalidRequest(format!("Unknown method: {}", method))),
         }
     }
@@ -231,6 +234,44 @@ impl RpcMethods {
 
         Ok(json!(LoadParquetResult {
             success: true,
+            row_count,
+        }))
+    }
+
+    async fn list_tables(&self, params: Value) -> Result<Value> {
+        let p: ListTablesParams = serde_json::from_value(params)?;
+        let session_id = parse_uuid(&p.session_id)?;
+        let session_manager = Arc::clone(&self.session_manager);
+
+        let table_infos = run_blocking(move || session_manager.list_tables(session_id)).await?;
+
+        Ok(json!(ListTablesResult {
+            tables: table_infos
+                .into_iter()
+                .map(|(name, row_count)| TableInfo { name, row_count })
+                .collect(),
+        }))
+    }
+
+    async fn describe_table(&self, params: Value) -> Result<Value> {
+        let p: DescribeTableParams = serde_json::from_value(params)?;
+        let session_id = parse_uuid(&p.session_id)?;
+        let table_name = p.table_name.clone();
+        let result_name = p.table_name;
+        let session_manager = Arc::clone(&self.session_manager);
+
+        let (schema, row_count) =
+            run_blocking(move || session_manager.describe_table(session_id, &table_name)).await?;
+
+        Ok(json!(DescribeTableResult {
+            name: result_name,
+            schema: schema
+                .into_iter()
+                .map(|(name, col_type)| ColumnDef {
+                    name,
+                    column_type: col_type,
+                })
+                .collect(),
             row_count,
         }))
     }

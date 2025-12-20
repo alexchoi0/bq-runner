@@ -49,11 +49,25 @@ impl Executor {
     ) -> Result<u64> {
         match self {
             Executor::Mock(e) => e.load_parquet(table_name, path, schema),
-            Executor::BigQuery(_) => {
-                Err(crate::error::Error::Executor(
-                    "load_parquet not supported for BigQuery executor".to_string(),
-                ))
-            }
+            Executor::BigQuery(e) => e.load_parquet(table_name, path, schema),
+        }
+    }
+
+    pub fn list_tables(&self) -> Result<Vec<(String, u64)>> {
+        match self {
+            Executor::Mock(e) => e.list_tables(),
+            Executor::BigQuery(_) => Err(crate::error::Error::Executor(
+                "list_tables not supported for BigQuery executor".to_string(),
+            )),
+        }
+    }
+
+    pub fn describe_table(&self, table_name: &str) -> Result<(Vec<(String, String)>, u64)> {
+        match self {
+            Executor::Mock(e) => e.describe_table(table_name),
+            Executor::BigQuery(_) => Err(crate::error::Error::Executor(
+                "describe_table not supported for BigQuery executor".to_string(),
+            )),
         }
     }
 }

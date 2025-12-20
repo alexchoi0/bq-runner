@@ -178,6 +178,26 @@ impl SessionManager {
             .ok_or(Error::SessionNotFound(session_id))?;
         session.executor.load_parquet(table_name, path, schema)
     }
+
+    pub fn list_tables(&self, session_id: Uuid) -> Result<Vec<(String, u64)>> {
+        let sessions = self.sessions.read();
+        let session = sessions
+            .get(&session_id)
+            .ok_or(Error::SessionNotFound(session_id))?;
+        session.executor.list_tables()
+    }
+
+    pub fn describe_table(
+        &self,
+        session_id: Uuid,
+        table_name: &str,
+    ) -> Result<(Vec<(String, String)>, u64)> {
+        let sessions = self.sessions.read();
+        let session = sessions
+            .get(&session_id)
+            .ok_or(Error::SessionNotFound(session_id))?;
+        session.executor.describe_table(table_name)
+    }
 }
 
 impl Default for SessionManager {

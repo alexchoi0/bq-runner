@@ -28,6 +28,19 @@ impl Error {
             Error::Internal(_) => -32603,
         }
     }
+
+    pub fn with_context(self, method: &str, session_id: Option<&str>) -> Self {
+        let context = match session_id {
+            Some(sid) => format!("[method={}, session={}]", method, sid),
+            None => format!("[method={}]", method),
+        };
+
+        match self {
+            Error::Executor(msg) => Error::Executor(format!("{} {}", context, msg)),
+            Error::Internal(msg) => Error::Internal(format!("{} {}", context, msg)),
+            other => other,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
