@@ -192,13 +192,35 @@ pub struct RunDagParams {
     pub session_id: String,
     #[serde(rename = "tableNames")]
     pub table_names: Option<Vec<String>>,
+    #[serde(rename = "retryCount", default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RunDagResult {
     pub success: bool,
-    #[serde(rename = "executedTables")]
-    pub executed_tables: Vec<String>,
+    #[serde(rename = "succeededTables")]
+    pub succeeded_tables: Vec<String>,
+    #[serde(rename = "failedTables")]
+    pub failed_tables: Vec<TableErrorInfo>,
+    #[serde(rename = "skippedTables")]
+    pub skipped_tables: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TableErrorInfo {
+    pub table: String,
+    pub error: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetryDagParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "failedTables")]
+    pub failed_tables: Vec<String>,
+    #[serde(rename = "skippedTables")]
+    pub skipped_tables: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

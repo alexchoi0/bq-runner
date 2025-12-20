@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -19,8 +21,81 @@ pub struct DagTable {
     pub is_source: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DagRunResult {
+    pub succeeded: Vec<String>,
+    pub failed: Vec<TableError>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableError {
+    pub table: String,
+    pub error: String,
+}
+
+impl DagRunResult {
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
+
+    pub fn all_succeeded(&self) -> bool {
+        self.failed.is_empty() && self.skipped.is_empty()
+    }
+}
+
 pub struct Dag {
     tables: HashMap<String, DagTable>,
+}
+
+struct StreamState {
+    pending_deps: HashMap<String, HashSet<String>>,
+    completed: HashSet<String>,
+    blocked: HashSet<String>,
+    in_flight: HashSet<String>,
+}
+
+impl StreamState {
+    fn is_pending(&self, name: &str) -> bool {
+        !self.completed.contains(name)
+            && !self.blocked.contains(name)
+            && !self.in_flight.contains(name)
+    }
+
+    fn is_ready(&self, name: &str) -> bool {
+        self.pending_deps
+            .get(name)
+            .map(|deps| deps.is_empty())
+            .unwrap_or(false)
+            && self.is_pending(name)
+    }
+
+    fn mark_completed(&mut self, name: &str) {
+        self.completed.insert(name.to_string());
+        for deps in self.pending_deps.values_mut() {
+            deps.remove(name);
+        }
+    }
+
+    fn mark_blocked(&mut self, name: &str) {
+        self.blocked.insert(name.to_string());
+    }
+
+    fn mark_in_flight(&mut self, name: &str) {
+        self.in_flight.insert(name.to_string());
+    }
+
+    fn finish_in_flight(&mut self, name: &str) {
+        self.in_flight.remove(name);
+    }
+
+    fn ready_tables(&self) -> Vec<String> {
+        self.pending_deps
+            .keys()
+            .filter(|name| self.is_ready(name))
+            .cloned()
+            .collect()
+    }
 }
 
 impl Dag {
@@ -94,7 +169,7 @@ impl Dag {
         &self,
         executor: Arc<Executor>,
         targets: Option<Vec<String>>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<DagRunResult> {
         let subset = if let Some(targets) = targets {
             self.get_tables_with_deps_set(&targets)?
         } else {
@@ -102,54 +177,208 @@ impl Dag {
         };
 
         let levels = self.topological_sort_levels(&subset)?;
-        let mut executed = Vec::new();
+        self.run_levels(executor, levels)
+    }
 
+    pub fn retry_failed(
+        &self,
+        executor: Arc<Executor>,
+        previous_result: &DagRunResult,
+    ) -> Result<DagRunResult> {
+        let to_retry: HashSet<String> = previous_result
+            .failed
+            .iter()
+            .map(|e| e.table.clone())
+            .chain(previous_result.skipped.iter().cloned())
+            .collect();
+
+        if to_retry.is_empty() {
+            return Ok(DagRunResult::default());
+        }
+
+        let levels = self.topological_sort_levels(&to_retry)?;
+        self.run_levels(executor, levels)
+    }
+
+    fn run_levels(
+        &self,
+        executor: Arc<Executor>,
+        levels: Vec<Vec<String>>,
+    ) -> Result<DagRunResult> {
         match executor.mode() {
-            ExecutorMode::Mock => {
-                for level in levels {
-                    for name in level {
-                        self.execute_single_table(&executor, &name)?;
-                        executed.push(name);
-                    }
-                }
-            }
-            ExecutorMode::BigQuery => {
-                for level in levels {
-                    if level.len() == 1 {
-                        let name = &level[0];
-                        self.execute_single_table(&executor, name)?;
-                        executed.push(name.clone());
-                    } else {
-                        let handles: Vec<_> = level
-                            .into_iter()
-                            .map(|name| {
-                                let executor = Arc::clone(&executor);
-                                let table = self.tables.get(&name).cloned();
-                                thread::spawn(move || -> Result<String> {
-                                    let table = table.ok_or_else(|| {
-                                        Error::InvalidRequest(format!("Table not found: {}", name))
-                                    })?;
-                                    execute_table(&executor, &table)?;
-                                    Ok(name)
-                                })
-                            })
-                            .collect();
+            ExecutorMode::Mock => self.run_levels_serial(&executor, levels),
+            ExecutorMode::BigQuery => self.run_streaming(executor, levels),
+        }
+    }
 
-                        for handle in handles {
-                            match handle.join() {
-                                Ok(Ok(name)) => executed.push(name),
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    return Err(Error::Internal("Thread panicked".to_string()))
-                                }
-                            }
-                        }
+    fn run_levels_serial(
+        &self,
+        executor: &Executor,
+        levels: Vec<Vec<String>>,
+    ) -> Result<DagRunResult> {
+        let mut result = DagRunResult::default();
+        let mut blocked_tables: HashSet<String> = HashSet::new();
+
+        for level in levels {
+            for name in level {
+                if self.should_skip(&name, &blocked_tables) {
+                    blocked_tables.insert(name.clone());
+                    result.skipped.push(name);
+                    continue;
+                }
+
+                match self.execute_single_table(executor, &name) {
+                    Ok(()) => result.succeeded.push(name),
+                    Err(e) => {
+                        blocked_tables.insert(name.clone());
+                        result.failed.push(TableError {
+                            table: name,
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
         }
 
-        Ok(executed)
+        Ok(result)
+    }
+
+    fn run_streaming(
+        &self,
+        executor: Arc<Executor>,
+        levels: Vec<Vec<String>>,
+    ) -> Result<DagRunResult> {
+        let all_tables: Vec<String> = levels.into_iter().flatten().collect();
+        if all_tables.is_empty() {
+            return Ok(DagRunResult::default());
+        }
+
+        let total_count = all_tables.len();
+
+        let pending_deps: HashMap<String, HashSet<String>> = all_tables
+            .iter()
+            .map(|name| {
+                let deps: HashSet<String> = self
+                    .tables
+                    .get(name)
+                    .map(|t| t.dependencies.iter().cloned().collect())
+                    .unwrap_or_default();
+                let relevant_deps: HashSet<String> = deps
+                    .into_iter()
+                    .filter(|d| all_tables.contains(d))
+                    .collect();
+                (name.clone(), relevant_deps)
+            })
+            .collect();
+
+        let state = Arc::new(Mutex::new(StreamState {
+            pending_deps,
+            completed: HashSet::new(),
+            blocked: HashSet::new(),
+            in_flight: HashSet::new(),
+        }));
+
+        let (tx, rx) = mpsc::channel::<(String, Result<()>)>();
+
+        self.spawn_ready_tables(&executor, &state, &tx);
+
+        let mut result = DagRunResult::default();
+        let mut processed = 0;
+
+        while processed < total_count {
+            let (name, outcome) = match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            };
+
+            processed += 1;
+
+            {
+                let mut s = state.lock();
+                s.finish_in_flight(&name);
+                match &outcome {
+                    Ok(()) => s.mark_completed(&name),
+                    Err(_) => s.mark_blocked(&name),
+                }
+            }
+
+            match outcome {
+                Ok(()) => result.succeeded.push(name),
+                Err(e) => {
+                    result.failed.push(TableError {
+                        table: name,
+                        error: e.to_string(),
+                    });
+                }
+            }
+
+            self.spawn_ready_tables(&executor, &state, &tx);
+
+            {
+                let mut s = state.lock();
+                let newly_skipped: Vec<String> = s
+                    .pending_deps
+                    .keys()
+                    .filter(|name| s.is_pending(name))
+                    .filter(|name| self.should_skip(name, &s.blocked))
+                    .cloned()
+                    .collect();
+
+                for name in newly_skipped {
+                    s.mark_blocked(&name);
+                    result.skipped.push(name);
+                    processed += 1;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn spawn_ready_tables(
+        &self,
+        executor: &Arc<Executor>,
+        state: &Arc<Mutex<StreamState>>,
+        tx: &mpsc::Sender<(String, Result<()>)>,
+    ) {
+        let ready: Vec<String> = {
+            let s = state.lock();
+            s.ready_tables()
+        };
+
+        for name in ready {
+            {
+                let mut s = state.lock();
+                if !s.is_pending(&name) {
+                    continue;
+                }
+                s.mark_in_flight(&name);
+            }
+
+            let executor = Arc::clone(executor);
+            let table = self.tables.get(&name).cloned();
+            let tx = tx.clone();
+
+            thread::spawn(move || {
+                let res = if let Some(table) = table {
+                    execute_table(&executor, &table)
+                } else {
+                    Err(Error::InvalidRequest(format!("Table not found: {}", name)))
+                };
+                let _ = tx.send((name, res));
+            });
+        }
+    }
+
+    fn should_skip(&self, table_name: &str, blocked_tables: &HashSet<String>) -> bool {
+        if let Some(table) = self.tables.get(table_name) {
+            for dep in &table.dependencies {
+                if blocked_tables.contains(dep) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn get_tables_with_deps_set(&self, targets: &[String]) -> Result<HashSet<String>> {
@@ -529,16 +758,17 @@ mod tests {
         )])
         .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed, vec!["users"]);
+        assert!(result.all_succeeded());
+        assert_eq!(result.succeeded, vec!["users"]);
 
-        let result = executor.execute_query("SELECT * FROM users ORDER BY id").unwrap();
-        assert_eq!(result.rows.len(), 2);
-        assert_eq!(result.rows[0][0], json!(1));
-        assert_eq!(result.rows[0][1], json!("Alice"));
-        assert_eq!(result.rows[1][0], json!(2));
-        assert_eq!(result.rows[1][1], json!("Bob"));
+        let query = executor.execute_query("SELECT * FROM users ORDER BY id").unwrap();
+        assert_eq!(query.rows.len(), 2);
+        assert_eq!(query.rows[0][0], json!(1));
+        assert_eq!(query.rows[0][1], json!("Alice"));
+        assert_eq!(query.rows[1][0], json!(2));
+        assert_eq!(query.rows[1][1], json!("Bob"));
     }
 
     #[test]
@@ -559,10 +789,10 @@ mod tests {
         )])
         .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert!(executed.contains(&"numbers".to_string()));
-        assert!(executed.contains(&"even_numbers".to_string()));
+        assert!(result.succeeded.contains(&"numbers".to_string()));
+        assert!(result.succeeded.contains(&"even_numbers".to_string()));
 
         let result = executor
             .execute_query("SELECT * FROM even_numbers ORDER BY value")
@@ -603,12 +833,12 @@ mod tests {
         )])
         .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 3);
-        let idx_raw = executed.iter().position(|x| x == "raw_numbers").unwrap();
-        let idx_doubled = executed.iter().position(|x| x == "doubled").unwrap();
-        let idx_plus_ten = executed.iter().position(|x| x == "plus_ten").unwrap();
+        assert_eq!(result.succeeded.len(), 3);
+        let idx_raw = result.succeeded.iter().position(|x| x == "raw_numbers").unwrap();
+        let idx_doubled = result.succeeded.iter().position(|x| x == "doubled").unwrap();
+        let idx_plus_ten = result.succeeded.iter().position(|x| x == "plus_ten").unwrap();
         assert!(idx_raw < idx_doubled);
         assert!(idx_doubled < idx_plus_ten);
 
@@ -644,13 +874,13 @@ mod tests {
         )])
         .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 4);
-        let idx_source = executed.iter().position(|x| x == "source").unwrap();
-        let idx_left = executed.iter().position(|x| x == "left_branch").unwrap();
-        let idx_right = executed.iter().position(|x| x == "right_branch").unwrap();
-        let idx_merged = executed.iter().position(|x| x == "merged").unwrap();
+        assert_eq!(result.succeeded.len(), 4);
+        let idx_source = result.succeeded.iter().position(|x| x == "source").unwrap();
+        let idx_left = result.succeeded.iter().position(|x| x == "left_branch").unwrap();
+        let idx_right = result.succeeded.iter().position(|x| x == "right_branch").unwrap();
+        let idx_merged = result.succeeded.iter().position(|x| x == "merged").unwrap();
 
         assert!(idx_source < idx_left);
         assert!(idx_source < idx_right);
@@ -681,15 +911,15 @@ mod tests {
         ])
         .unwrap();
 
-        let executed = dag
+        let result = dag
             .run(executor.clone(), Some(vec!["from_a".to_string()]))
             .unwrap();
 
-        assert!(executed.contains(&"a".to_string()));
-        assert!(executed.contains(&"from_a".to_string()));
-        assert!(!executed.contains(&"b".to_string()));
-        assert!(!executed.contains(&"from_b".to_string()));
-        assert!(!executed.contains(&"c".to_string()));
+        assert!(result.succeeded.contains(&"a".to_string()));
+        assert!(result.succeeded.contains(&"from_a".to_string()));
+        assert!(!result.succeeded.contains(&"b".to_string()));
+        assert!(!result.succeeded.contains(&"from_b".to_string()));
+        assert!(!result.succeeded.contains(&"c".to_string()));
 
         let result = executor.execute_query("SELECT * FROM from_a").unwrap();
         assert_eq!(result.rows[0][0], json!(10));
@@ -714,18 +944,18 @@ mod tests {
         ])
         .unwrap();
 
-        let executed = dag
+        let result = dag
             .run(
                 executor.clone(),
                 Some(vec!["from_x".to_string(), "from_y".to_string()]),
             )
             .unwrap();
 
-        assert_eq!(executed.len(), 4);
-        assert!(executed.contains(&"x".to_string()));
-        assert!(executed.contains(&"y".to_string()));
-        assert!(executed.contains(&"from_x".to_string()));
-        assert!(executed.contains(&"from_y".to_string()));
+        assert_eq!(result.succeeded.len(), 4);
+        assert!(result.succeeded.contains(&"x".to_string()));
+        assert!(result.succeeded.contains(&"y".to_string()));
+        assert!(result.succeeded.contains(&"from_x".to_string()));
+        assert!(result.succeeded.contains(&"from_y".to_string()));
     }
 
     #[test]
@@ -850,8 +1080,8 @@ mod tests {
         )])
         .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
-        assert_eq!(executed, vec!["empty_table"]);
+        let result = dag.run(executor.clone(), None).unwrap();
+        assert_eq!(result.succeeded, vec!["empty_table"]);
 
         let result = executor
             .execute_query("SELECT * FROM empty_table")
@@ -1157,16 +1387,16 @@ mod tests {
             .unwrap();
         }
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 11);
-        assert_eq!(executed[0], "root");
+        assert_eq!(result.succeeded.len(), 11);
+        assert_eq!(result.succeeded[0], "root");
 
         for i in 0..10 {
-            let result = executor
+            let query = executor
                 .execute_query(&format!("SELECT * FROM branch_{}", i))
                 .unwrap();
-            assert_eq!(result.rows[0][0], json!(1 + i as i64));
+            assert_eq!(query.rows[0][0], json!(1 + i as i64));
         }
     }
 
@@ -1190,16 +1420,16 @@ mod tests {
             .unwrap();
         }
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 21);
+        assert_eq!(result.succeeded.len(), 21);
 
         for i in 0..=20 {
-            assert_eq!(executed[i], format!("step_{}", i));
+            assert_eq!(result.succeeded[i], format!("step_{}", i));
         }
 
-        let result = executor.execute_query("SELECT * FROM step_20").unwrap();
-        assert_eq!(result.rows[0][0], json!(20));
+        let query = executor.execute_query("SELECT * FROM step_20").unwrap();
+        assert_eq!(query.rows[0][0], json!(20));
     }
 
     #[test]
@@ -1225,11 +1455,11 @@ mod tests {
         dag.register(vec![computed_table("t_e", "SELECT v FROM t_d")])
             .unwrap();
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 5);
+        assert_eq!(result.succeeded.len(), 5);
 
-        let pos = |name: &str| executed.iter().position(|x| x == name).unwrap();
+        let pos = |name: &str| result.succeeded.iter().position(|x| x == name).unwrap();
 
         assert!(pos("t_a") < pos("t_c"));
         assert!(pos("t_b") < pos("t_d"));
@@ -1272,16 +1502,16 @@ mod tests {
         MAX_CONCURRENT.store(0, Ordering::SeqCst);
         CURRENT_CONCURRENT.store(0, Ordering::SeqCst);
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 6);
-        assert_eq!(executed[0], "base");
+        assert_eq!(result.succeeded.len(), 6);
+        assert_eq!(result.succeeded[0], "base");
 
         for i in 0..5 {
-            let result = executor
+            let query = executor
                 .execute_query(&format!("SELECT * FROM branch_{}", i))
                 .unwrap();
-            assert_eq!(result.rows.len(), 1);
+            assert_eq!(query.rows.len(), 1);
         }
     }
 
@@ -1311,15 +1541,15 @@ mod tests {
         assert_eq!(levels.len(), 1, "All tables should be in same level (independent)");
         assert_eq!(levels[0].len(), 3, "Should have 3 independent tables");
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 3);
+        assert_eq!(result.succeeded.len(), 3);
 
-        for name in &executed {
-            let result = executor
+        for name in &result.succeeded {
+            let query = executor
                 .execute_query(&format!("SELECT * FROM {}", name))
                 .unwrap();
-            assert_eq!(result.rows.len(), 1);
+            assert_eq!(query.rows.len(), 1);
         }
     }
 
@@ -1343,12 +1573,12 @@ mod tests {
             ])
             .unwrap();
 
-            let executed = dag.run(executor.clone(), None).unwrap();
+            let result = dag.run(executor.clone(), None).unwrap();
 
-            assert_eq!(executed[0], "root");
-            assert_eq!(executed[1], "a");
-            assert_eq!(executed[2], "b");
-            assert_eq!(executed[3], "c");
+            assert_eq!(result.succeeded[0], "root");
+            assert_eq!(result.succeeded[1], "a");
+            assert_eq!(result.succeeded[2], "b");
+            assert_eq!(result.succeeded[3], "c");
         }
     }
 
@@ -1389,16 +1619,16 @@ mod tests {
         assert_eq!(levels.len(), 1, "All heavy tables should be at same level");
         assert_eq!(levels[0].len(), 5, "Should have 5 independent heavy tables");
 
-        let executed = dag.run(executor.clone(), None).unwrap();
+        let result = dag.run(executor.clone(), None).unwrap();
 
-        assert_eq!(executed.len(), 5);
+        assert_eq!(result.succeeded.len(), 5);
 
-        for name in &executed {
-            let result = executor
+        for name in &result.succeeded {
+            let query = executor
                 .execute_query(&format!("SELECT * FROM {}", name))
                 .unwrap();
-            assert_eq!(result.rows.len(), 1);
-            assert_eq!(result.rows[0][0], json!(499500)); // sum of 0..999
+            assert_eq!(query.rows.len(), 1);
+            assert_eq!(query.rows[0][0], json!(499500)); // sum of 0..999
         }
 
         assert!(
@@ -1411,5 +1641,212 @@ mod tests {
     fn test_verify_executor_mode_is_mock() {
         let executor = create_mock_executor();
         assert_eq!(executor.mode(), ExecutorMode::Mock);
+    }
+
+    #[test]
+    fn test_failed_table_tracked() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        dag.register(vec![computed_table(
+            "bad_query",
+            "SELECT * FROM nonexistent_table",
+        )])
+        .unwrap();
+
+        let result = dag.run(executor.clone(), None).unwrap();
+
+        assert!(!result.all_succeeded());
+        assert!(result.succeeded.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].table, "bad_query");
+        assert!(result.failed[0].error.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_downstream_tables_skipped_on_failure() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        dag.register(vec![computed_table(
+            "failing_source",
+            "SELECT * FROM nonexistent_table",
+        )])
+        .unwrap();
+
+        dag.register(vec![computed_table(
+            "dependent_a",
+            "SELECT * FROM failing_source",
+        )])
+        .unwrap();
+
+        dag.register(vec![computed_table(
+            "dependent_b",
+            "SELECT * FROM dependent_a",
+        )])
+        .unwrap();
+
+        let result = dag.run(executor.clone(), None).unwrap();
+
+        assert!(!result.all_succeeded());
+        assert!(result.succeeded.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].table, "failing_source");
+        assert_eq!(result.skipped.len(), 2);
+        assert!(result.skipped.contains(&"dependent_a".to_string()));
+        assert!(result.skipped.contains(&"dependent_b".to_string()));
+    }
+
+    #[test]
+    fn test_partial_success_with_independent_tables() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        executor
+            .execute_statement("CREATE TABLE good_data (v INT64)")
+            .unwrap();
+        executor
+            .execute_statement("INSERT INTO good_data VALUES (42)")
+            .unwrap();
+
+        dag.register(vec![
+            computed_table("good_table", "SELECT v FROM good_data"),
+            computed_table("bad_table", "SELECT * FROM nonexistent"),
+        ])
+        .unwrap();
+
+        let result = dag.run(executor.clone(), None).unwrap();
+
+        assert!(!result.all_succeeded());
+        assert_eq!(result.succeeded.len(), 1);
+        assert!(result.succeeded.contains(&"good_table".to_string()));
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].table, "bad_table");
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_retry_failed_tables() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        dag.register(vec![computed_table(
+            "needs_setup",
+            "SELECT v FROM setup_table",
+        )])
+        .unwrap();
+
+        dag.register(vec![computed_table(
+            "downstream",
+            "SELECT v * 2 AS v FROM needs_setup",
+        )])
+        .unwrap();
+
+        let first_result = dag.run(executor.clone(), None).unwrap();
+        assert!(!first_result.all_succeeded());
+        assert_eq!(first_result.failed.len(), 1);
+        assert_eq!(first_result.failed[0].table, "needs_setup");
+        assert_eq!(first_result.skipped.len(), 1);
+        assert_eq!(first_result.skipped[0], "downstream");
+
+        executor
+            .execute_statement("CREATE TABLE setup_table (v INT64)")
+            .unwrap();
+        executor
+            .execute_statement("INSERT INTO setup_table VALUES (100)")
+            .unwrap();
+
+        let retry_result = dag.retry_failed(executor.clone(), &first_result).unwrap();
+
+        assert!(retry_result.all_succeeded());
+        assert_eq!(retry_result.succeeded.len(), 2);
+        assert!(retry_result.succeeded.contains(&"needs_setup".to_string()));
+        assert!(retry_result.succeeded.contains(&"downstream".to_string()));
+        assert!(retry_result.failed.is_empty());
+        assert!(retry_result.skipped.is_empty());
+
+        let query = executor.execute_query("SELECT * FROM downstream").unwrap();
+        assert_eq!(query.rows[0][0], json!(200));
+    }
+
+    #[test]
+    fn test_retry_preserves_successful_tables() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        executor
+            .execute_statement("CREATE TABLE source_a (v INT64)")
+            .unwrap();
+        executor
+            .execute_statement("INSERT INTO source_a VALUES (10)")
+            .unwrap();
+
+        dag.register(vec![
+            computed_table("from_a", "SELECT v FROM source_a"),
+            computed_table("from_b", "SELECT v FROM source_b"),
+        ])
+        .unwrap();
+
+        let first_result = dag.run(executor.clone(), None).unwrap();
+
+        assert_eq!(first_result.succeeded.len(), 1);
+        assert!(first_result.succeeded.contains(&"from_a".to_string()));
+        assert_eq!(first_result.failed.len(), 1);
+        assert_eq!(first_result.failed[0].table, "from_b");
+
+        executor
+            .execute_statement("CREATE TABLE source_b (v INT64)")
+            .unwrap();
+        executor
+            .execute_statement("INSERT INTO source_b VALUES (20)")
+            .unwrap();
+
+        let retry_result = dag.retry_failed(executor.clone(), &first_result).unwrap();
+
+        assert!(retry_result.all_succeeded());
+        assert_eq!(retry_result.succeeded.len(), 1);
+        assert!(retry_result.succeeded.contains(&"from_b".to_string()));
+    }
+
+    #[test]
+    fn test_diamond_dependency_with_one_branch_failing() {
+        let mut dag = Dag::new();
+        let executor = create_mock_executor();
+
+        dag.register(vec![source_table(
+            "root",
+            vec![("v", "INT64")],
+            vec![json!([1])],
+        )])
+        .unwrap();
+
+        executor
+            .execute_statement("CREATE TABLE external_good (v INT64)")
+            .unwrap();
+        executor
+            .execute_statement("INSERT INTO external_good VALUES (5)")
+            .unwrap();
+
+        dag.register(vec![
+            computed_table("left_good", "SELECT v FROM external_good"),
+            computed_table("right_bad", "SELECT v FROM nonexistent"),
+        ])
+        .unwrap();
+
+        dag.register(vec![computed_table(
+            "merged",
+            "SELECT l.v + r.v AS v FROM left_good l, right_bad r",
+        )])
+        .unwrap();
+
+        let result = dag.run(executor.clone(), None).unwrap();
+
+        assert_eq!(result.succeeded.len(), 2);
+        assert!(result.succeeded.contains(&"root".to_string()));
+        assert!(result.succeeded.contains(&"left_good".to_string()));
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].table, "right_bad");
+        assert_eq!(result.skipped.len(), 1);
+        assert!(result.skipped.contains(&"merged".to_string()));
     }
 }

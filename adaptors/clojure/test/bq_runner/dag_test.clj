@@ -53,7 +53,7 @@
             :sql "SELECT id, UPPER(value) as upper_value FROM source_data"}])
         (let [run-result (bq/run-dag! s)]
           (is (true? (:success run-result)))
-          (is (= 2 (count (:executedTables run-result)))))
+          (is (= 2 (count (:succeededTables run-result)))))
         (let [query-result (bq/query s "SELECT * FROM transformed ORDER BY id")]
           (is (= [{:id 1 :upper_value "HELLO"}
                   {:id 2 :upper_value "WORLD"}]
@@ -70,8 +70,8 @@
            {:name :from_b :sql "SELECT x * 100 as x FROM b"}])
         (let [result (bq/run-dag! s :from_a)]
           (is (true? (:success result)))
-          (is (some #{"a"} (:executedTables result)))
-          (is (some #{"from_a"} (:executedTables result))))
+          (is (some #{"a"} (:succeededTables result)))
+          (is (some #{"from_a"} (:succeededTables result))))
         (let [query-result (bq/query s "SELECT * FROM from_a")]
           (is (= [{:x 10}] query-result)))))))
 

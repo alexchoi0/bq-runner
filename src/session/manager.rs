@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::executor::{BigQueryExecutor, Executor, ExecutorMode, QueryResult, YachtSqlExecutor};
 use crate::rpc::types::{DagTableDef, DagTableDetail, DagTableInfo};
 
-use super::dag::Dag;
+use super::dag::{Dag, DagRunResult, TableError};
 
 pub struct SessionManager {
     sessions: RwLock<HashMap<Uuid, Session>>,
@@ -94,12 +94,58 @@ impl SessionManager {
         &self,
         session_id: Uuid,
         targets: Option<Vec<String>>,
-    ) -> Result<Vec<String>> {
+        retry_count: u32,
+    ) -> Result<DagRunResult> {
         let sessions = self.sessions.read();
         let session = sessions
             .get(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
-        session.dag.run(Arc::clone(&session.executor), targets)
+
+        let mut result = session.dag.run(Arc::clone(&session.executor), targets)?;
+
+        for _ in 0..retry_count {
+            if result.all_succeeded() {
+                break;
+            }
+
+            let retry_result = session
+                .dag
+                .retry_failed(Arc::clone(&session.executor), &result)?;
+
+            result.succeeded.extend(retry_result.succeeded);
+            result.failed = retry_result.failed;
+            result.skipped = retry_result.skipped;
+        }
+
+        Ok(result)
+    }
+
+    pub fn retry_dag(
+        &self,
+        session_id: Uuid,
+        failed_tables: Vec<String>,
+        skipped_tables: Vec<String>,
+    ) -> Result<DagRunResult> {
+        let sessions = self.sessions.read();
+        let session = sessions
+            .get(&session_id)
+            .ok_or(Error::SessionNotFound(session_id))?;
+
+        let previous_result = DagRunResult {
+            succeeded: vec![],
+            failed: failed_tables
+                .into_iter()
+                .map(|t| TableError {
+                    table: t,
+                    error: String::new(),
+                })
+                .collect(),
+            skipped: skipped_tables,
+        };
+
+        session
+            .dag
+            .retry_failed(Arc::clone(&session.executor), &previous_result)
     }
 
     pub fn get_dag(&self, session_id: Uuid) -> Result<Vec<DagTableDetail>> {
@@ -402,7 +448,7 @@ mod tests {
                         }
                     }
 
-                    let result = manager.run_dag(session_id, None);
+                    let result = manager.run_dag(session_id, None, 0);
 
                     CONCURRENT_EXECUTIONS.fetch_sub(1, Ordering::SeqCst);
 
@@ -419,8 +465,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         for (session_id, result) in &results {
-            let executed = result.as_ref().expect("DAG should execute successfully");
-            assert_eq!(executed.len(), 2, "Each session should execute 2 tables");
+            let dag_result = result.as_ref().expect("DAG should execute successfully");
+            assert_eq!(dag_result.succeeded.len(), 2, "Each session should execute 2 tables");
 
             let sum_result = manager
                 .execute_query(*session_id, "SELECT * FROM sum_table")
@@ -494,14 +540,14 @@ mod tests {
         let manager1 = Arc::clone(&manager);
         let manager2 = Arc::clone(&manager);
 
-        let handle1 = std::thread::spawn(move || manager1.run_dag(s1, None));
-        let handle2 = std::thread::spawn(move || manager2.run_dag(s2, None));
+        let handle1 = std::thread::spawn(move || manager1.run_dag(s1, None, 0));
+        let handle2 = std::thread::spawn(move || manager2.run_dag(s2, None, 0));
 
         let result1 = handle1.join().unwrap().unwrap();
         let result2 = handle2.join().unwrap().unwrap();
 
-        assert_eq!(result1, vec!["result"]);
-        assert_eq!(result2, vec!["result"]);
+        assert_eq!(result1.succeeded, vec!["result"]);
+        assert_eq!(result2.succeeded, vec!["result"]);
 
         let query1 = manager.execute_query(s1, "SELECT * FROM result").unwrap();
         let query2 = manager.execute_query(s2, "SELECT * FROM result").unwrap();
@@ -561,7 +607,7 @@ mod tests {
             .map(|(session_id, base_value)| {
                 let manager = Arc::clone(&manager);
                 std::thread::spawn(move || {
-                    let result = manager.run_dag(session_id, None);
+                    let result = manager.run_dag(session_id, None, 0);
                     COMPLETED_SESSIONS.fetch_add(1, Ordering::SeqCst);
                     (session_id, base_value, result)
                 })
@@ -580,12 +626,12 @@ mod tests {
         );
 
         for (session_id, base_value, result) in results {
-            let executed = result.unwrap();
-            assert_eq!(executed.len(), 3);
+            let dag_result = result.unwrap();
+            assert_eq!(dag_result.succeeded.len(), 3);
 
-            assert_eq!(executed[0], "step1");
-            assert_eq!(executed[1], "step2");
-            assert_eq!(executed[2], "step3");
+            assert_eq!(dag_result.succeeded[0], "step1");
+            assert_eq!(dag_result.succeeded[1], "step2");
+            assert_eq!(dag_result.succeeded[2], "step3");
 
             let final_result = manager
                 .execute_query(session_id, "SELECT * FROM step3")
@@ -639,14 +685,14 @@ mod tests {
             );
         }
 
-        let executed = manager.run_dag(session_id, None).unwrap();
+        let dag_result = manager.run_dag(session_id, None, 0).unwrap();
 
-        assert_eq!(executed.len(), 5);
+        assert_eq!(dag_result.succeeded.len(), 5);
 
-        let mut sorted_executed = executed.clone();
+        let mut sorted_executed = dag_result.succeeded.clone();
         sorted_executed.sort();
         assert_eq!(
-            executed, sorted_executed,
+            dag_result.succeeded, sorted_executed,
             "In mock mode, tables at same level should execute in alphabetical order"
         );
 
