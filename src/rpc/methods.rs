@@ -11,7 +11,8 @@ use super::types::{
     ClearDagParams, ClearDagResult, CreateSessionResult, CreateTableParams, CreateTableResult,
     DestroySessionParams, DestroySessionResult, GetDagParams, GetDagResult, InsertParams,
     InsertResult, LoadParquetParams, LoadParquetResult, PingResult, QueryParams,
-    RegisterDagParams, RegisterDagResult, RunDagParams, RunDagResult,
+    RegisterDagParams, RegisterDagResult, RetryDagParams, RunDagParams, RunDagResult,
+    TableErrorInfo,
 };
 
 pub struct RpcMethods {
@@ -33,6 +34,7 @@ impl RpcMethods {
             "bq.insert" => self.insert(params).await,
             "bq.registerDag" => self.register_dag(params).await,
             "bq.runDag" => self.run_dag(params).await,
+            "bq.retryDag" => self.retry_dag(params).await,
             "bq.getDag" => self.get_dag(params).await,
             "bq.clearDag" => self.clear_dag(params).await,
             "bq.loadParquet" => self.load_parquet(params).await,
@@ -146,14 +148,51 @@ impl RpcMethods {
         let p: RunDagParams = serde_json::from_value(params)?;
         let session_id = parse_uuid(&p.session_id)?;
         let targets = p.table_names;
+        let retry_count = p.retry_count;
         let session_manager = Arc::clone(&self.session_manager);
 
-        let executed =
-            run_blocking(move || session_manager.run_dag(session_id, targets)).await?;
+        let result =
+            run_blocking(move || session_manager.run_dag(session_id, targets, retry_count)).await?;
 
         Ok(json!(RunDagResult {
-            success: true,
-            executed_tables: executed,
+            success: result.all_succeeded(),
+            succeeded_tables: result.succeeded,
+            failed_tables: result
+                .failed
+                .into_iter()
+                .map(|e| TableErrorInfo {
+                    table: e.table,
+                    error: e.error,
+                })
+                .collect(),
+            skipped_tables: result.skipped,
+        }))
+    }
+
+    async fn retry_dag(&self, params: Value) -> Result<Value> {
+        let p: RetryDagParams = serde_json::from_value(params)?;
+        let session_id = parse_uuid(&p.session_id)?;
+        let failed_tables = p.failed_tables;
+        let skipped_tables = p.skipped_tables;
+        let session_manager = Arc::clone(&self.session_manager);
+
+        let result = run_blocking(move || {
+            session_manager.retry_dag(session_id, failed_tables, skipped_tables)
+        })
+        .await?;
+
+        Ok(json!(RunDagResult {
+            success: result.all_succeeded(),
+            succeeded_tables: result.succeeded,
+            failed_tables: result
+                .failed
+                .into_iter()
+                .map(|e| TableErrorInfo {
+                    table: e.table,
+                    error: e.error,
+                })
+                .collect(),
+            skipped_tables: result.skipped,
         }))
     }
 
