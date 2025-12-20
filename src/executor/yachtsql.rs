@@ -1,11 +1,11 @@
 use std::fs::File;
 
 use arrow::array::Array;
-use arrow::datatypes::DataType;
+use arrow::datatypes::DataType as ArrowDataType;
 use parking_lot::Mutex;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{json, Value as JsonValue};
-use yachtsql::{QueryExecutor as YachtExecutor, Value as YachtValue, Table};
+use yachtsql::{DataType, QueryExecutor as YachtExecutor, Table, Value as YachtValue};
 
 use crate::error::{Error, Result};
 
@@ -116,6 +116,53 @@ impl YachtSqlExecutor {
 
         Ok(total_rows)
     }
+
+    pub fn list_tables(&self) -> Result<Vec<(String, u64)>> {
+        let result = self.execute_query(
+            "SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema = 'public'"
+        )?;
+
+        let tables: Vec<(String, u64)> = result
+            .rows
+            .into_iter()
+            .map(|row| {
+                let name = row[0].as_str().unwrap_or("").to_string();
+                let row_count = row[1].as_u64().unwrap_or(0);
+                (name, row_count)
+            })
+            .collect();
+
+        Ok(tables)
+    }
+
+    pub fn describe_table(&self, table_name: &str) -> Result<(Vec<(String, String)>, u64)> {
+        let schema_sql = format!(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
+            table_name
+        );
+        let schema_result = self.execute_query(&schema_sql)?;
+
+        let schema: Vec<(String, String)> = schema_result
+            .rows
+            .into_iter()
+            .map(|row| {
+                let name = row[0].as_str().unwrap_or("").to_string();
+                let col_type = row[1].as_str().unwrap_or("STRING").to_string();
+                (name, col_type)
+            })
+            .collect();
+
+        let count_sql = format!("SELECT COUNT(*) FROM {}", table_name);
+        let count_result = self.execute_query(&count_sql)?;
+        let row_count = count_result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        Ok((schema, row_count))
+    }
 }
 
 impl Default for YachtSqlExecutor {
@@ -125,8 +172,14 @@ impl Default for YachtSqlExecutor {
 }
 
 #[derive(Debug, Clone)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryResult {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<JsonValue>>,
 }
 
@@ -135,7 +188,7 @@ impl QueryResult {
         let schema_fields: Vec<JsonValue> = self
             .columns
             .iter()
-            .map(|name| json!({ "name": name, "type": "STRING" }))
+            .map(|col| json!({ "name": col.name, "type": col.data_type }))
             .collect();
 
         let rows: Vec<JsonValue> = self
@@ -159,17 +212,44 @@ impl QueryResult {
 
 fn table_to_query_result(table: &Table) -> Result<QueryResult> {
     let schema = table.schema();
-    let columns: Vec<String> = schema.fields().iter().map(|f| f.name.clone()).collect();
+    let columns: Vec<ColumnInfo> = schema
+        .fields()
+        .iter()
+        .map(|f| ColumnInfo {
+            name: f.name.clone(),
+            data_type: datatype_to_bq_type(&f.data_type),
+        })
+        .collect();
 
     let records = table.to_records().map_err(|e| Error::Executor(e.to_string()))?;
     let rows: Vec<Vec<JsonValue>> = records
         .iter()
-        .map(|record| {
-            record.values().iter().map(yacht_value_to_json).collect()
-        })
+        .map(|record| record.values().iter().map(yacht_value_to_json).collect())
         .collect();
 
     Ok(QueryResult { columns, rows })
+}
+
+fn datatype_to_bq_type(dt: &DataType) -> String {
+    match dt {
+        DataType::Bool => "BOOLEAN".to_string(),
+        DataType::Int64 => "INT64".to_string(),
+        DataType::Float64 => "FLOAT64".to_string(),
+        DataType::Numeric(_) | DataType::BigNumeric => "NUMERIC".to_string(),
+        DataType::String => "STRING".to_string(),
+        DataType::Bytes => "BYTES".to_string(),
+        DataType::Date => "DATE".to_string(),
+        DataType::DateTime => "DATETIME".to_string(),
+        DataType::Time => "TIME".to_string(),
+        DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Geography => "GEOGRAPHY".to_string(),
+        DataType::Json => "JSON".to_string(),
+        DataType::Struct(_) => "STRUCT".to_string(),
+        DataType::Array(inner) => format!("ARRAY<{}>", datatype_to_bq_type(inner)),
+        DataType::Interval => "INTERVAL".to_string(),
+        DataType::Range(_) => "STRING".to_string(),
+        DataType::Unknown => "STRING".to_string(),
+    }
 }
 
 fn yacht_value_to_json(value: &YachtValue) -> JsonValue {
@@ -237,23 +317,23 @@ fn arrow_value_to_sql(array: &dyn Array, row: usize, bq_type: &str) -> String {
     }
 
     match array.data_type() {
-        DataType::Boolean => {
+        ArrowDataType::Boolean => {
             let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Int8 => {
+        ArrowDataType::Int8 => {
             let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Int16 => {
+        ArrowDataType::Int16 => {
             let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Int32 => {
+        ArrowDataType::Int32 => {
             let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Int64 => {
+        ArrowDataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
             let val = arr.value(row);
             match bq_type.to_uppercase().as_str() {
@@ -262,50 +342,50 @@ fn arrow_value_to_sql(array: &dyn Array, row: usize, bq_type: &str) -> String {
                 _ => val.to_string(),
             }
         }
-        DataType::UInt8 => {
+        ArrowDataType::UInt8 => {
             let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::UInt16 => {
+        ArrowDataType::UInt16 => {
             let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::UInt32 => {
+        ArrowDataType::UInt32 => {
             let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::UInt64 => {
+        ArrowDataType::UInt64 => {
             let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Float32 => {
+        ArrowDataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Float64 => {
+        ArrowDataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
             arr.value(row).to_string()
         }
-        DataType::Utf8 => {
+        ArrowDataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
             format!("'{}'", arr.value(row).replace('\'', "''"))
         }
-        DataType::LargeUtf8 => {
+        ArrowDataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             format!("'{}'", arr.value(row).replace('\'', "''"))
         }
-        DataType::Date32 => {
+        ArrowDataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = arr.value(row);
             format!("DATE_FROM_UNIX_DATE({})", days)
         }
-        DataType::Date64 => {
+        ArrowDataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
             let ms = arr.value(row);
             let days = ms / (24 * 60 * 60 * 1000);
             format!("DATE_FROM_UNIX_DATE({})", days)
         }
-        DataType::Timestamp(unit, _) => {
+        ArrowDataType::Timestamp(unit, _) => {
             let micros = match unit {
                 arrow::datatypes::TimeUnit::Second => {
                     let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();

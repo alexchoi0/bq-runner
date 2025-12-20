@@ -53,13 +53,21 @@ pub async fn process_message(msg: &str, methods: &RpcMethods) -> RpcResponse {
     }
 
     let id = request.id.clone().unwrap_or(Value::Null);
+    let method_name = request.method.clone();
+
+    let session_id = request
+        .params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     match methods.dispatch(&request.method, request.params).await {
         Ok(result) => RpcResponse::success(id, result),
         Err(e) => {
             if matches!(e, crate::error::Error::InvalidRequest(ref msg) if msg.starts_with("Unknown method")) {
-                RpcResponse::method_not_found(id, &request.method)
+                RpcResponse::method_not_found(id, &method_name)
             } else {
+                let e = e.with_context(&method_name, session_id.as_deref());
                 RpcResponse::error(id, e.code(), e.to_string())
             }
         }

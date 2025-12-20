@@ -271,3 +271,37 @@ pub struct LoadParquetResult {
     #[serde(rename = "rowCount")]
     pub row_count: u64,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ListTablesParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListTablesResult {
+    pub tables: Vec<TableInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TableInfo {
+    pub name: String,
+    #[serde(rename = "rowCount")]
+    pub row_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DescribeTableParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "tableName")]
+    pub table_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DescribeTableResult {
+    pub name: String,
+    pub schema: Vec<ColumnDef>,
+    #[serde(rename = "rowCount")]
+    pub row_count: u64,
+}
