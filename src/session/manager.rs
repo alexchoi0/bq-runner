@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::executor::{BigQueryExecutor, Executor, ExecutorMode, QueryResult, YachtSqlExecutor};
 use crate::rpc::types::{DagTableDef, DagTableDetail, DagTableInfo};
 
-use super::dag::{Dag, DagRunResult, TableError};
+use super::pipeline::{Pipeline, PipelineResult, TableError};
 
 pub struct SessionManager {
     sessions: RwLock<HashMap<Uuid, Session>>,
@@ -17,7 +17,7 @@ pub struct SessionManager {
 
 struct Session {
     executor: Arc<Executor>,
-    dag: Dag,
+    pipeline: Pipeline,
 }
 
 impl SessionManager {
@@ -41,11 +41,11 @@ impl SessionManager {
             ExecutorMode::Mock => Executor::Mock(YachtSqlExecutor::new()?),
             ExecutorMode::BigQuery => Executor::BigQuery(BigQueryExecutor::new().await?),
         };
-        let dag = Dag::new();
+        let pipeline = Pipeline::new();
 
         let session = Session {
             executor: Arc::new(executor),
-            dag,
+            pipeline,
         };
 
         self.sessions.write().insert(session_id, session);
@@ -87,7 +87,7 @@ impl SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
-        session.dag.register(tables)
+        session.pipeline.register(tables)
     }
 
     pub fn run_dag(
@@ -95,13 +95,13 @@ impl SessionManager {
         session_id: Uuid,
         targets: Option<Vec<String>>,
         retry_count: u32,
-    ) -> Result<DagRunResult> {
+    ) -> Result<PipelineResult> {
         let sessions = self.sessions.read();
         let session = sessions
             .get(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
 
-        let mut result = session.dag.run(Arc::clone(&session.executor), targets)?;
+        let mut result = session.pipeline.run(Arc::clone(&session.executor), targets)?;
 
         for _ in 0..retry_count {
             if result.all_succeeded() {
@@ -109,7 +109,7 @@ impl SessionManager {
             }
 
             let retry_result = session
-                .dag
+                .pipeline
                 .retry_failed(Arc::clone(&session.executor), &result)?;
 
             result.succeeded.extend(retry_result.succeeded);
@@ -125,13 +125,13 @@ impl SessionManager {
         session_id: Uuid,
         failed_tables: Vec<String>,
         skipped_tables: Vec<String>,
-    ) -> Result<DagRunResult> {
+    ) -> Result<PipelineResult> {
         let sessions = self.sessions.read();
         let session = sessions
             .get(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
 
-        let previous_result = DagRunResult {
+        let previous_result = PipelineResult {
             succeeded: vec![],
             failed: failed_tables
                 .into_iter()
@@ -144,7 +144,7 @@ impl SessionManager {
         };
 
         session
-            .dag
+            .pipeline
             .retry_failed(Arc::clone(&session.executor), &previous_result)
     }
 
@@ -153,7 +153,7 @@ impl SessionManager {
         let session = sessions
             .get(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
-        Ok(session.dag.get_tables())
+        Ok(session.pipeline.get_tables())
     }
 
     pub fn clear_dag(&self, session_id: Uuid) -> Result<()> {
@@ -161,7 +161,7 @@ impl SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(Error::SessionNotFound(session_id))?;
-        session.dag.clear(&session.executor);
+        session.pipeline.clear(&session.executor);
         Ok(())
     }
 

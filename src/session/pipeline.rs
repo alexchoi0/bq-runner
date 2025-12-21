@@ -12,7 +12,7 @@ use crate::rpc::types::{ColumnDef, DagTableDef, DagTableDetail, DagTableInfo};
 use crate::utils::json_to_sql_value;
 
 #[derive(Debug, Clone)]
-pub struct DagTable {
+pub struct PipelineTable {
     pub name: String,
     pub sql: Option<String>,
     pub schema: Option<Vec<ColumnDef>>,
@@ -22,7 +22,7 @@ pub struct DagTable {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct DagRunResult {
+pub struct PipelineResult {
     pub succeeded: Vec<String>,
     pub failed: Vec<TableError>,
     pub skipped: Vec<String>,
@@ -34,14 +34,14 @@ pub struct TableError {
     pub error: String,
 }
 
-impl DagRunResult {
+impl PipelineResult {
     pub fn all_succeeded(&self) -> bool {
         self.failed.is_empty() && self.skipped.is_empty()
     }
 }
 
-pub struct Dag {
-    tables: HashMap<String, DagTable>,
+pub struct Pipeline {
+    tables: HashMap<String, PipelineTable>,
 }
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -103,7 +103,7 @@ impl StreamState {
     }
 }
 
-impl Dag {
+impl Pipeline {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
@@ -121,7 +121,7 @@ impl Dag {
                 extract_dependencies(def.sql.as_deref().unwrap_or(""), &self.tables)
             };
 
-            let table = DagTable {
+            let table = PipelineTable {
                 name: def.name.clone(),
                 sql: def.sql,
                 schema: def.schema,
@@ -174,7 +174,7 @@ impl Dag {
         &self,
         executor: Arc<Executor>,
         targets: Option<Vec<String>>,
-    ) -> Result<DagRunResult> {
+    ) -> Result<PipelineResult> {
         let subset = if let Some(targets) = targets {
             self.get_tables_with_deps_set(&targets)?
         } else {
@@ -187,8 +187,8 @@ impl Dag {
     pub fn retry_failed(
         &self,
         executor: Arc<Executor>,
-        previous_result: &DagRunResult,
-    ) -> Result<DagRunResult> {
+        previous_result: &PipelineResult,
+    ) -> Result<PipelineResult> {
         let subset: HashSet<String> = previous_result
             .failed
             .iter()
@@ -202,27 +202,36 @@ impl Dag {
     fn run_subset(
         &self,
         executor: Arc<Executor>,
-        subset: HashSet<String>,
-    ) -> Result<DagRunResult> {
-        if subset.is_empty() {
-            return Ok(DagRunResult::default());
+        tables: HashSet<String>,
+    ) -> Result<PipelineResult> {
+        if tables.is_empty() {
+            return Ok(PipelineResult::default());
         }
 
         match executor.mode() {
             ExecutorMode::Mock => {
-                let levels = self.topological_sort_levels(&subset)?;
-                self.run_serial(&executor, levels)
+                let levels = self.topological_sort_levels(&tables)?;
+                self.run_in_serial(&executor, levels)
             }
-            ExecutorMode::BigQuery => self.run_streaming(executor, subset),
+            ExecutorMode::BigQuery => self.run_via_streaming(executor, tables),
         }
     }
 
-    fn run_serial(
+    fn run_single_threaded(
+        &self,
+        executor: &Executor,
+        tables: &HashSet<String>,
+    ) -> Result<PipelineResult> {
+        let levels = self.topological_sort_levels(tables)?;
+        self.run_in_serial(&executor, levels)
+    }
+
+    fn run_in_serial(
         &self,
         executor: &Executor,
         levels: Vec<Vec<String>>,
-    ) -> Result<DagRunResult> {
-        let mut result = DagRunResult::default();
+    ) -> Result<PipelineResult> {
+        let mut result = PipelineResult::default();
         let mut blocked_tables: HashSet<String> = HashSet::new();
 
         for level in levels {
@@ -249,11 +258,11 @@ impl Dag {
         Ok(result)
     }
 
-    fn run_streaming(
+    fn run_via_streaming(
         &self,
         executor: Arc<Executor>,
         subset: HashSet<String>,
-    ) -> Result<DagRunResult> {
+    ) -> Result<PipelineResult> {
         let all_tables: Vec<String> = subset.into_iter().collect();
         let total_count = all_tables.len();
 
@@ -290,7 +299,7 @@ impl Dag {
 
         self.spawn_ready_tables(&executor, &state, &tx);
 
-        let mut result = DagRunResult::default();
+        let mut result = PipelineResult::default();
         let mut processed = 0;
 
         while processed < total_count {
@@ -418,17 +427,17 @@ impl Dag {
         execute_table(executor, table)
     }
 
-    fn topological_sort_levels(&self, subset: &HashSet<String>) -> Result<Vec<Vec<String>>> {
+    fn topological_sort_levels(&self, queries: &HashSet<String>) -> Result<Vec<Vec<String>>> {
         let mut in_degree: HashMap<String, usize> = HashMap::new();
         let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
 
-        for name in subset {
-            in_degree.entry(name.clone()).or_insert(0);
-            if let Some(table) = self.tables.get(name) {
+        for query in queries {
+            in_degree.entry(query.clone()).or_insert(0);
+            if let Some(table) = self.tables.get(query) {
                 for dep in &table.dependencies {
-                    if subset.contains(dep) {
-                        *in_degree.entry(name.clone()).or_insert(0) += 1;
-                        dependents.entry(dep.clone()).or_default().push(name.clone());
+                    if queries.contains(dep) {
+                        *in_degree.entry(query.clone()).or_insert(0) += 1;
+                        dependents.entry(dep.clone()).or_default().push(query.clone());
                     }
                 }
             }
@@ -465,7 +474,7 @@ impl Dag {
             levels.push(current_level);
         }
 
-        if processed != subset.len() {
+        if processed != queries.len() {
             return Err(Error::InvalidRequest("Circular dependency detected".to_string()));
         }
 
@@ -493,13 +502,13 @@ impl Dag {
     }
 }
 
-impl Default for Dag {
+impl Default for Pipeline {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
+fn execute_table(executor: &Executor, table: &PipelineTable) -> Result<()> {
     if table.is_source {
         create_source_table_standalone(executor, table)?;
     } else if let Some(sql) = &table.sql {
@@ -547,7 +556,7 @@ fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
     Ok(())
 }
 
-fn create_source_table_standalone(executor: &Executor, table: &DagTable) -> Result<()> {
+fn create_source_table_standalone(executor: &Executor, table: &PipelineTable) -> Result<()> {
     if let Some(schema) = &table.schema {
         let columns: Vec<String> = schema
             .iter()
@@ -588,7 +597,7 @@ fn create_source_table_standalone(executor: &Executor, table: &DagTable) -> Resu
     Ok(())
 }
 
-fn extract_dependencies(sql: &str, known_tables: &HashMap<String, DagTable>) -> Vec<String> {
+fn extract_dependencies(sql: &str, known_tables: &HashMap<String, PipelineTable>) -> Vec<String> {
     let cte_names = extract_cte_names(sql);
     let mut deps = Vec::new();
     let sql_upper = sql.to_uppercase();
@@ -758,14 +767,14 @@ mod tests {
 
     #[test]
     fn test_register_single_source_table() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let tables = vec![source_table(
             "users",
             vec![("id", "INT64"), ("name", "STRING")],
             vec![],
         )];
 
-        let result = dag.register(tables).unwrap();
+        let result = pipeline.register(tables).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "users");
@@ -774,16 +783,16 @@ mod tests {
 
     #[test]
     fn test_register_computed_table_with_dependency() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "users",
             vec![("id", "INT64"), ("name", "STRING")],
             vec![],
         )])
         .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "active_users",
                 "SELECT * FROM users WHERE active = true",
@@ -797,9 +806,9 @@ mod tests {
 
     #[test]
     fn test_register_multiple_dependencies() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("users", vec![("id", "INT64"), ("name", "STRING")], vec![]),
             source_table(
                 "orders",
@@ -809,7 +818,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "user_orders",
                 "SELECT u.name, o.id FROM users u JOIN orders o ON u.id = o.user_id",
@@ -824,17 +833,17 @@ mod tests {
 
     #[test]
     fn test_run_single_source_table() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "users",
             vec![("id", "INT64"), ("name", "STRING")],
             vec![json!([1, "Alice"]), json!([2, "Bob"])],
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert!(result.all_succeeded());
         assert_eq!(result.succeeded, vec!["users"]);
@@ -849,23 +858,23 @@ mod tests {
 
     #[test]
     fn test_run_computed_table_from_source() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "numbers",
             vec![("value", "INT64")],
             vec![json!([1]), json!([2]), json!([3]), json!([4]), json!([5])],
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "even_numbers",
             "SELECT value FROM numbers WHERE value % 2 = 0",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert!(result.succeeded.contains(&"numbers".to_string()));
         assert!(result.succeeded.contains(&"even_numbers".to_string()));
@@ -880,10 +889,10 @@ mod tests {
 
     #[test]
     fn test_run_chain_of_computed_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "raw_numbers",
             vec![("n", "INT64")],
             vec![
@@ -897,19 +906,19 @@ mod tests {
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "doubled",
             "SELECT n * 2 AS n FROM raw_numbers",
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "plus_ten",
             "SELECT n + 10 AS n FROM doubled",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 3);
         let idx_raw = result.succeeded.iter().position(|x| x == "raw_numbers").unwrap();
@@ -928,29 +937,29 @@ mod tests {
 
     #[test]
     fn test_run_diamond_dependency() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "source",
             vec![("x", "INT64")],
             vec![json!([10]), json!([20]), json!([30])],
         )])
         .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("left_branch", "SELECT x + 1 AS x FROM source"),
             computed_table("right_branch", "SELECT x - 1 AS x FROM source"),
         ])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "merged",
             "SELECT l.x AS left_x, r.x AS right_x FROM left_branch l, right_branch r WHERE l.x - r.x = 2",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 4);
         let idx_source = result.succeeded.iter().position(|x| x == "source").unwrap();
@@ -971,23 +980,23 @@ mod tests {
 
     #[test]
     fn test_run_with_specific_targets() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("a", vec![("v", "INT64")], vec![json!([1])]),
             source_table("b", vec![("v", "INT64")], vec![json!([2])]),
             source_table("c", vec![("v", "INT64")], vec![json!([3])]),
         ])
         .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("from_a", "SELECT v * 10 AS v FROM a"),
             computed_table("from_b", "SELECT v * 10 AS v FROM b"),
         ])
         .unwrap();
 
-        let result = dag
+        let result = pipeline
             .run(executor.clone(), Some(vec!["from_a".to_string()]))
             .unwrap();
 
@@ -1005,22 +1014,22 @@ mod tests {
 
     #[test]
     fn test_run_with_multiple_targets() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("x", vec![("v", "INT64")], vec![json!([100])]),
             source_table("y", vec![("v", "INT64")], vec![json!([200])]),
         ])
         .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("from_x", "SELECT v FROM x"),
             computed_table("from_y", "SELECT v FROM y"),
         ])
         .unwrap();
 
-        let result = dag
+        let result = pipeline
             .run(
                 executor.clone(),
                 Some(vec!["from_x".to_string(), "from_y".to_string()]),
@@ -1036,17 +1045,17 @@ mod tests {
 
     #[test]
     fn test_topological_sort_levels_independent_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("a", vec![("v", "INT64")], vec![]),
             source_table("b", vec![("v", "INT64")], vec![]),
             source_table("c", vec![("v", "INT64")], vec![]),
         ])
         .unwrap();
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].len(), 3);
@@ -1054,19 +1063,19 @@ mod tests {
 
     #[test]
     fn test_topological_sort_levels_linear_chain() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("a", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("a", vec![("v", "INT64")], vec![])])
             .unwrap();
-        dag.register(vec![computed_table("b", "SELECT * FROM a")])
+        pipeline.register(vec![computed_table("b", "SELECT * FROM a")])
             .unwrap();
-        dag.register(vec![computed_table("c", "SELECT * FROM b")])
+        pipeline.register(vec![computed_table("c", "SELECT * FROM b")])
             .unwrap();
-        dag.register(vec![computed_table("d", "SELECT * FROM c")])
+        pipeline.register(vec![computed_table("d", "SELECT * FROM c")])
             .unwrap();
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 4);
         assert_eq!(levels[0], vec!["a"]);
@@ -1077,23 +1086,23 @@ mod tests {
 
     #[test]
     fn test_topological_sort_levels_diamond() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("root", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("root", vec![("v", "INT64")], vec![])])
             .unwrap();
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("left", "SELECT * FROM root"),
             computed_table("right", "SELECT * FROM root"),
         ])
         .unwrap();
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "bottom",
             "SELECT * FROM left, right",
         )])
         .unwrap();
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[0], vec!["root"]);
@@ -1105,29 +1114,29 @@ mod tests {
 
     #[test]
     fn test_topological_sort_levels_complex_dag() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("s1", vec![("v", "INT64")], vec![]),
             source_table("s2", vec![("v", "INT64")], vec![]),
         ])
         .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("a", "SELECT * FROM s1"),
             computed_table("b", "SELECT * FROM s2"),
             computed_table("c", "SELECT * FROM s1, s2"),
         ])
         .unwrap();
 
-        dag.register(vec![computed_table("d", "SELECT * FROM a, b")])
+        pipeline.register(vec![computed_table("d", "SELECT * FROM a, b")])
             .unwrap();
 
-        dag.register(vec![computed_table("e", "SELECT * FROM c, d")])
+        pipeline.register(vec![computed_table("e", "SELECT * FROM c, d")])
             .unwrap();
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 4);
 
@@ -1146,17 +1155,17 @@ mod tests {
 
     #[test]
     fn test_empty_source_table() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "empty_table",
             vec![("id", "INT64"), ("value", "STRING")],
             vec![],
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
         assert_eq!(result.succeeded, vec!["empty_table"]);
 
         let result = executor
@@ -1169,10 +1178,10 @@ mod tests {
 
     #[test]
     fn test_aggregation_query() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "sales",
             vec![("product", "STRING"), ("amount", "INT64")],
             vec![
@@ -1185,13 +1194,13 @@ mod tests {
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "sales_summary",
             "SELECT product, SUM(amount) AS total FROM sales GROUP BY product",
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM sales_summary ORDER BY product")
@@ -1215,10 +1224,10 @@ mod tests {
 
     #[test]
     fn test_join_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table(
                 "customers",
                 vec![("id", "INT64"), ("name", "STRING")],
@@ -1240,13 +1249,13 @@ mod tests {
         ])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "customer_orders",
             "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id = o.customer_id",
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM customer_orders ORDER BY name, total")
@@ -1256,25 +1265,25 @@ mod tests {
 
     #[test]
     fn test_clear_dag() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "test_table",
             vec![("v", "INT64")],
             vec![json!([42])],
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         assert!(executor
             .execute_query("SELECT * FROM test_table")
             .is_ok());
 
-        dag.clear(&executor);
+        pipeline.clear(&executor);
 
-        assert!(dag.get_tables().is_empty());
+        assert!(pipeline.get_tables().is_empty());
         assert!(executor
             .execute_query("SELECT * FROM test_table")
             .is_err());
@@ -1282,17 +1291,17 @@ mod tests {
 
     #[test]
     fn test_get_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("src", vec![("v", "INT64")], vec![]),
         ])
         .unwrap();
 
-        dag.register(vec![computed_table("derived", "SELECT * FROM src")])
+        pipeline.register(vec![computed_table("derived", "SELECT * FROM src")])
             .unwrap();
 
-        let tables = dag.get_tables();
+        let tables = pipeline.get_tables();
         assert_eq!(tables.len(), 2);
 
         let src = tables.iter().find(|t| t.name == "src").unwrap();
@@ -1308,10 +1317,10 @@ mod tests {
 
     #[test]
     fn test_null_values() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "with_nulls",
             vec![("id", "INT64"), ("value", "STRING")],
             vec![
@@ -1322,7 +1331,7 @@ mod tests {
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM with_nulls ORDER BY id")
@@ -1333,10 +1342,10 @@ mod tests {
 
     #[test]
     fn test_boolean_values() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "flags",
             vec![("name", "STRING"), ("active", "BOOL")],
             vec![
@@ -1347,13 +1356,13 @@ mod tests {
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "active_flags",
             "SELECT name FROM flags WHERE active = true",
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM active_flags ORDER BY name")
@@ -1365,10 +1374,10 @@ mod tests {
 
     #[test]
     fn test_float_values() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "measurements",
             vec![("sensor", "STRING"), ("reading", "FLOAT64")],
             vec![
@@ -1379,13 +1388,13 @@ mod tests {
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "high_readings",
             "SELECT sensor, reading FROM measurements WHERE reading > 50",
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM high_readings ORDER BY reading")
@@ -1395,12 +1404,12 @@ mod tests {
 
     #[test]
     fn test_dependency_detection_case_insensitive() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("MyTable", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("MyTable", vec![("v", "INT64")], vec![])])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table("derived", "SELECT * FROM mytable")])
             .unwrap();
 
@@ -1409,7 +1418,7 @@ mod tests {
 
     #[test]
     fn test_rerun_computed_table_reflects_source_changes() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
         executor
@@ -1419,13 +1428,13 @@ mod tests {
             .execute_statement("INSERT INTO counter VALUES (1)")
             .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "doubled",
             "SELECT n * 2 AS n FROM counter",
         )])
         .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor.execute_query("SELECT * FROM doubled").unwrap();
         assert_eq!(result.rows[0][0], json!(2));
@@ -1434,7 +1443,7 @@ mod tests {
             .execute_statement("INSERT INTO counter VALUES (10)")
             .unwrap();
 
-        dag.run(executor.clone(), None).unwrap();
+        pipeline.run(executor.clone(), None).unwrap();
 
         let result = executor
             .execute_query("SELECT * FROM doubled ORDER BY n")
@@ -1446,10 +1455,10 @@ mod tests {
 
     #[test]
     fn test_wide_dag_many_independent_branches() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "root",
             vec![("v", "INT64")],
             vec![json!([1])],
@@ -1457,14 +1466,14 @@ mod tests {
         .unwrap();
 
         for i in 0..10 {
-            dag.register(vec![computed_table(
+            pipeline.register(vec![computed_table(
                 &format!("branch_{}", i),
                 &format!("SELECT v + {} AS v FROM root", i),
             )])
             .unwrap();
         }
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 11);
         assert_eq!(result.succeeded[0], "root");
@@ -1479,10 +1488,10 @@ mod tests {
 
     #[test]
     fn test_deep_dag_long_chain() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "step_0",
             vec![("n", "INT64")],
             vec![json!([0])],
@@ -1490,14 +1499,14 @@ mod tests {
         .unwrap();
 
         for i in 1..=20 {
-            dag.register(vec![computed_table(
+            pipeline.register(vec![computed_table(
                 &format!("step_{}", i),
                 &format!("SELECT n + 1 AS n FROM step_{}", i - 1),
             )])
             .unwrap();
         }
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 21);
 
@@ -1511,28 +1520,28 @@ mod tests {
 
     #[test]
     fn test_execution_order_respects_dependencies() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("t_a", vec![("v", "INT64")], vec![json!([1])]),
             source_table("t_b", vec![("v", "INT64")], vec![json!([2])]),
         ])
         .unwrap();
 
-        dag.register(vec![computed_table("t_c", "SELECT v FROM t_a")])
+        pipeline.register(vec![computed_table("t_c", "SELECT v FROM t_a")])
             .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "t_d",
             "SELECT t_b.v FROM t_b JOIN t_c ON 1=1",
         )])
         .unwrap();
 
-        dag.register(vec![computed_table("t_e", "SELECT v FROM t_d")])
+        pipeline.register(vec![computed_table("t_e", "SELECT v FROM t_d")])
             .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 5);
 
@@ -1546,10 +1555,10 @@ mod tests {
 
     #[test]
     fn test_mock_mode_executes_serially() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "base",
             vec![("id", "INT64")],
             vec![json!([1])],
@@ -1557,15 +1566,15 @@ mod tests {
         .unwrap();
 
         for i in 0..5 {
-            dag.register(vec![computed_table(
+            pipeline.register(vec![computed_table(
                 &format!("branch_{}", i),
                 "SELECT id FROM base",
             )])
             .unwrap();
         }
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[0], vec!["base"]);
@@ -1579,7 +1588,7 @@ mod tests {
         MAX_CONCURRENT.store(0, Ordering::SeqCst);
         CURRENT_CONCURRENT.store(0, Ordering::SeqCst);
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 6);
         assert_eq!(result.succeeded[0], "base");
@@ -1594,7 +1603,7 @@ mod tests {
 
     #[test]
     fn test_mock_mode_serial_execution_timing() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
         executor
@@ -1605,20 +1614,20 @@ mod tests {
             .unwrap();
 
         for i in 0..3 {
-            dag.register(vec![computed_table(
+            pipeline.register(vec![computed_table(
                 &format!("timing_{}", i),
                 "SELECT id FROM timing_base",
             )])
             .unwrap();
         }
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 1, "All tables should be in same level (independent)");
         assert_eq!(levels[0].len(), 3, "Should have 3 independent tables");
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 3);
 
@@ -1633,24 +1642,24 @@ mod tests {
     #[test]
     fn test_mock_mode_execution_order_is_deterministic() {
         for _ in 0..5 {
-            let mut dag = Dag::new();
+            let mut pipeline = Pipeline::new();
             let executor = create_mock_executor();
 
-            dag.register(vec![source_table(
+            pipeline.register(vec![source_table(
                 "root",
                 vec![("v", "INT64")],
                 vec![json!([1])],
             )])
             .unwrap();
 
-            dag.register(vec![
+            pipeline.register(vec![
                 computed_table("a", "SELECT v FROM root"),
                 computed_table("b", "SELECT v FROM root"),
                 computed_table("c", "SELECT v FROM root"),
             ])
             .unwrap();
 
-            let result = dag.run(executor.clone(), None).unwrap();
+            let result = pipeline.run(executor.clone(), None).unwrap();
 
             assert_eq!(result.succeeded[0], "root");
             assert_eq!(result.succeeded[1], "a");
@@ -1669,7 +1678,7 @@ mod tests {
         IS_EXECUTING.store(false, Ordering::SeqCst);
         OVERLAP_DETECTED.store(false, Ordering::SeqCst);
 
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
         executor
@@ -1683,20 +1692,20 @@ mod tests {
         }
 
         for i in 0..5 {
-            dag.register(vec![computed_table(
+            pipeline.register(vec![computed_table(
                 &format!("heavy_{}", i),
                 "SELECT SUM(v) as total FROM serial_base",
             )])
             .unwrap();
         }
 
-        let all_names: HashSet<String> = dag.tables.keys().cloned().collect();
-        let levels = dag.topological_sort_levels(&all_names).unwrap();
+        let all_names: HashSet<String> = pipeline.tables.keys().cloned().collect();
+        let levels = pipeline.topological_sort_levels(&all_names).unwrap();
 
         assert_eq!(levels.len(), 1, "All heavy tables should be at same level");
         assert_eq!(levels[0].len(), 5, "Should have 5 independent heavy tables");
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 5);
 
@@ -1722,16 +1731,16 @@ mod tests {
 
     #[test]
     fn test_failed_table_tracked() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "bad_query",
             "SELECT * FROM nonexistent_table",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert!(!result.all_succeeded());
         assert!(result.succeeded.is_empty());
@@ -1742,28 +1751,28 @@ mod tests {
 
     #[test]
     fn test_downstream_tables_skipped_on_failure() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "failing_source",
             "SELECT * FROM nonexistent_table",
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "dependent_a",
             "SELECT * FROM failing_source",
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "dependent_b",
             "SELECT * FROM dependent_a",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert!(!result.all_succeeded());
         assert!(result.succeeded.is_empty());
@@ -1776,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_partial_success_with_independent_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
         executor
@@ -1786,13 +1795,13 @@ mod tests {
             .execute_statement("INSERT INTO good_data VALUES (42)")
             .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("good_table", "SELECT v FROM good_data"),
             computed_table("bad_table", "SELECT * FROM nonexistent"),
         ])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert!(!result.all_succeeded());
         assert_eq!(result.succeeded.len(), 1);
@@ -1804,22 +1813,22 @@ mod tests {
 
     #[test]
     fn test_retry_failed_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "needs_setup",
             "SELECT v FROM setup_table",
         )])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "downstream",
             "SELECT v * 2 AS v FROM needs_setup",
         )])
         .unwrap();
 
-        let first_result = dag.run(executor.clone(), None).unwrap();
+        let first_result = pipeline.run(executor.clone(), None).unwrap();
         assert!(!first_result.all_succeeded());
         assert_eq!(first_result.failed.len(), 1);
         assert_eq!(first_result.failed[0].table, "needs_setup");
@@ -1833,7 +1842,7 @@ mod tests {
             .execute_statement("INSERT INTO setup_table VALUES (100)")
             .unwrap();
 
-        let retry_result = dag.retry_failed(executor.clone(), &first_result).unwrap();
+        let retry_result = pipeline.retry_failed(executor.clone(), &first_result).unwrap();
 
         assert!(retry_result.all_succeeded());
         assert_eq!(retry_result.succeeded.len(), 2);
@@ -1848,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_retry_preserves_successful_tables() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
         executor
@@ -1858,13 +1867,13 @@ mod tests {
             .execute_statement("INSERT INTO source_a VALUES (10)")
             .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("from_a", "SELECT v FROM source_a"),
             computed_table("from_b", "SELECT v FROM source_b"),
         ])
         .unwrap();
 
-        let first_result = dag.run(executor.clone(), None).unwrap();
+        let first_result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(first_result.succeeded.len(), 1);
         assert!(first_result.succeeded.contains(&"from_a".to_string()));
@@ -1878,7 +1887,7 @@ mod tests {
             .execute_statement("INSERT INTO source_b VALUES (20)")
             .unwrap();
 
-        let retry_result = dag.retry_failed(executor.clone(), &first_result).unwrap();
+        let retry_result = pipeline.retry_failed(executor.clone(), &first_result).unwrap();
 
         assert!(retry_result.all_succeeded());
         assert_eq!(retry_result.succeeded.len(), 1);
@@ -1887,10 +1896,10 @@ mod tests {
 
     #[test]
     fn test_diamond_dependency_with_one_branch_failing() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
         let executor = create_mock_executor();
 
-        dag.register(vec![source_table(
+        pipeline.register(vec![source_table(
             "root",
             vec![("v", "INT64")],
             vec![json!([1])],
@@ -1904,19 +1913,19 @@ mod tests {
             .execute_statement("INSERT INTO external_good VALUES (5)")
             .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             computed_table("left_good", "SELECT v FROM external_good"),
             computed_table("right_bad", "SELECT v FROM nonexistent"),
         ])
         .unwrap();
 
-        dag.register(vec![computed_table(
+        pipeline.register(vec![computed_table(
             "merged",
             "SELECT l.v + r.v AS v FROM left_good l, right_bad r",
         )])
         .unwrap();
 
-        let result = dag.run(executor.clone(), None).unwrap();
+        let result = pipeline.run(executor.clone(), None).unwrap();
 
         assert_eq!(result.succeeded.len(), 2);
         assert!(result.succeeded.contains(&"root".to_string()));
@@ -1929,15 +1938,15 @@ mod tests {
 
     #[test]
     fn test_cte_not_detected_as_dependency() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
             .unwrap();
 
-        dag.register(vec![source_table("cte_alias", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("cte_alias", vec![("v", "INT64")], vec![])])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "derived",
                 "WITH cte_alias AS (SELECT v FROM real_table) SELECT * FROM cte_alias",
@@ -1950,18 +1959,18 @@ mod tests {
 
     #[test]
     fn test_multiple_ctes_not_detected_as_dependencies() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("base", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("base", vec![("v", "INT64")], vec![])])
             .unwrap();
 
-        dag.register(vec![
+        pipeline.register(vec![
             source_table("first", vec![("v", "INT64")], vec![]),
             source_table("second", vec![("v", "INT64")], vec![]),
         ])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "derived",
                 "WITH first AS (SELECT 1 AS v), second AS (SELECT 2 AS v) SELECT * FROM first, second, base",
@@ -1973,15 +1982,15 @@ mod tests {
 
     #[test]
     fn test_table_name_prefix_not_matched() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("user", vec![("id", "INT64")], vec![])])
+        pipeline.register(vec![source_table("user", vec![("id", "INT64")], vec![])])
             .unwrap();
 
-        dag.register(vec![source_table("users", vec![("id", "INT64")], vec![])])
+        pipeline.register(vec![source_table("users", vec![("id", "INT64")], vec![])])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "derived",
                 "SELECT * FROM users",
@@ -1994,15 +2003,15 @@ mod tests {
 
     #[test]
     fn test_cte_with_recursive() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("nums", vec![("n", "INT64")], vec![])])
+        pipeline.register(vec![source_table("nums", vec![("n", "INT64")], vec![])])
             .unwrap();
 
-        dag.register(vec![source_table("seq", vec![("n", "INT64")], vec![])])
+        pipeline.register(vec![source_table("seq", vec![("n", "INT64")], vec![])])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "derived",
                 "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM seq WHERE n < 10) SELECT * FROM seq, nums",
@@ -2015,12 +2024,12 @@ mod tests {
 
     #[test]
     fn test_subquery_alias_not_detected() {
-        let mut dag = Dag::new();
+        let mut pipeline = Pipeline::new();
 
-        dag.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
+        pipeline.register(vec![source_table("real_table", vec![("v", "INT64")], vec![])])
             .unwrap();
 
-        let result = dag
+        let result = pipeline
             .register(vec![computed_table(
                 "derived",
                 "SELECT * FROM (SELECT v FROM real_table) AS sub",
