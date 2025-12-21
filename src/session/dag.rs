@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::executor::{Executor, ExecutorMode};
 use crate::rpc::types::{ColumnDef, DagTableDef, DagTableDetail, DagTableInfo};
-use crate::utils::json_to_sql_value;
+use crate::utils::{json_to_sql_value, value_to_sql};
 
 #[derive(Debug, Clone)]
 pub struct DagTable {
@@ -510,9 +510,9 @@ fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
             Error::Executor(format!("Failed to execute query for table {}: {}", table.name, e))
         })?;
 
-        if !query_result.columns.is_empty() {
+        if !query_result.schema.is_empty() {
             let column_types: Vec<String> = query_result
-                .columns
+                .schema
                 .iter()
                 .map(|col| format!("{} {}", col.name, col.data_type))
                 .collect();
@@ -522,14 +522,14 @@ fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
                 table.name,
                 column_types.join(", ")
             );
-            executor.execute_statement(&create_sql)?;
+            executor.execute(&create_sql)?;
 
             if !query_result.rows.is_empty() {
                 let values: Vec<String> = query_result
                     .rows
                     .iter()
                     .map(|row| {
-                        let vals: Vec<String> = row.iter().map(json_to_sql_value).collect();
+                        let vals: Vec<String> = row.iter().map(value_to_sql).collect();
                         format!("({})", vals.join(", "))
                     })
                     .collect();
@@ -539,7 +539,7 @@ fn execute_table(executor: &Executor, table: &DagTable) -> Result<()> {
                     table.name,
                     values.join(", ")
                 );
-                executor.execute_statement(&insert_sql)?;
+                executor.execute(&insert_sql)?;
             }
         }
     }

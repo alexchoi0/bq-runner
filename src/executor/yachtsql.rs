@@ -130,7 +130,7 @@ impl YachtSqlExecutor {
             .into_iter()
             .map(|row| {
                 let name = row[0].as_str().unwrap_or("").to_string();
-                let row_count = row[1].as_u64().unwrap_or(0);
+                let row_count = row[1].as_i64().unwrap_or(0) as u64;
                 (name, row_count)
             })
             .collect();
@@ -143,9 +143,9 @@ impl YachtSqlExecutor {
             "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
             table_name
         );
-        let schema_result = self.execute_query(&schema_sql)?;
+        let result = self.execute_query(&schema_sql)?;
 
-        let schema: Vec<(String, String)> = schema_result
+        let table_schema: Vec<(String, String)> = result
             .rows
             .into_iter()
             .map(|row| {
@@ -161,10 +161,10 @@ impl YachtSqlExecutor {
             .rows
             .first()
             .and_then(|row| row.first())
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as u64;
 
-        Ok((schema, row_count))
+        Ok((table_schema, row_count))
     }
 }
 

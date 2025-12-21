@@ -23,6 +23,10 @@ google-cloud-bigquery = "0.15"
 google-cloud-auth = "0.19"
 parquet = "54"
 arrow = "54"
+chrono = "0.4"
+rust_decimal = "1"
+base64 = "0.22"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

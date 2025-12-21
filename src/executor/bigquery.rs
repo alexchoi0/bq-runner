@@ -8,8 +8,8 @@ use google_cloud_bigquery::http::table::{
     SourceFormat, TableFieldSchema, TableFieldType, TableReference, TableSchema,
 };
 use google_cloud_bigquery::http::tabledata::list::Value as BqValue;
-use serde_json::Value as JsonValue;
 use tokio::runtime::Handle;
+use yachtsql::Value;
 
 use crate::error::{Error, Result};
 use crate::rpc::types::ColumnDef;
@@ -179,7 +179,13 @@ impl BigQueryExecutor {
             .await
             .map_err(|e| Error::Executor(format!("BigQuery query failed: {}\n\nSQL: {}", e, sql)))?;
 
-        let columns: Vec<ColumnInfo> = response
+        let field_types: Vec<TableFieldType> = response
+            .schema
+            .as_ref()
+            .map(|s| s.fields.iter().map(|f| f.data_type.clone()).collect())
+            .unwrap_or_default();
+
+        let schema: Vec<ColumnInfo> = response
             .schema
             .as_ref()
             .map(|s| {
@@ -193,16 +199,21 @@ impl BigQueryExecutor {
             })
             .unwrap_or_default();
 
-        let rows: Vec<Vec<JsonValue>> = response
+        let rows: Vec<Vec<Value>> = response
             .rows
             .unwrap_or_default()
             .into_iter()
             .map(|tuple| {
-                tuple.f.into_iter().map(|cell| bq_value_to_json(cell.v)).collect()
+                tuple
+                    .f
+                    .into_iter()
+                    .zip(field_types.iter())
+                    .map(|(cell, field_type)| bq_value_to_yachtsql(cell.v, field_type))
+                    .collect()
             })
             .collect();
 
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult { schema, rows })
     }
 
     pub fn execute_statement(&self, sql: &str) -> Result<u64> {
@@ -268,15 +279,94 @@ fn string_to_bq_type(type_str: &str) -> TableFieldType {
     }
 }
 
-fn bq_value_to_json(value: BqValue) -> JsonValue {
+fn bq_value_to_yachtsql(value: BqValue, field_type: &TableFieldType) -> Value {
     match value {
-        BqValue::Null => JsonValue::Null,
-        BqValue::String(s) => JsonValue::String(s),
+        BqValue::Null => Value::Null,
+        BqValue::String(s) => parse_bq_string(&s, field_type),
         BqValue::Array(cells) => {
-            JsonValue::Array(cells.into_iter().map(|c| bq_value_to_json(c.v)).collect())
+            let inner_type = match field_type {
+                TableFieldType::Record | TableFieldType::Struct => field_type.clone(),
+                _ => field_type.clone(),
+            };
+            Value::Array(
+                cells
+                    .into_iter()
+                    .map(|c| bq_value_to_yachtsql(c.v, &inner_type))
+                    .collect(),
+            )
         }
-        BqValue::Struct(tuple) => {
-            JsonValue::Array(tuple.f.into_iter().map(|c| bq_value_to_json(c.v)).collect())
+        BqValue::Struct(tuple) => Value::Struct(
+            tuple
+                .f
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let val = bq_value_to_yachtsql(c.v, &TableFieldType::String);
+                    (format!("f{}", i), val)
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn parse_bq_string(s: &str, field_type: &TableFieldType) -> Value {
+    match field_type {
+        TableFieldType::String => Value::String(s.to_string()),
+        TableFieldType::Bytes => {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+                .map(Value::Bytes)
+                .unwrap_or_else(|_| Value::String(s.to_string()))
         }
+        TableFieldType::Integer | TableFieldType::Int64 => s
+            .parse::<i64>()
+            .map(Value::Int64)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Float | TableFieldType::Float64 => s
+            .parse::<f64>()
+            .map(Value::float64)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Boolean | TableFieldType::Bool => match s.to_lowercase().as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(s.to_string()),
+        },
+        TableFieldType::Timestamp => {
+            if let Ok(ts) = s.parse::<f64>() {
+                let secs = ts as i64;
+                let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+                if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+                    return Value::Timestamp(dt);
+                }
+            }
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| Value::Timestamp(dt.with_timezone(&chrono::Utc)))
+                .unwrap_or_else(|_| Value::String(s.to_string()))
+        }
+        TableFieldType::Date => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map(Value::Date)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Time => chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+            .map(Value::Time)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Datetime => chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+            .map(Value::DateTime)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Numeric | TableFieldType::Decimal => s
+            .parse::<rust_decimal::Decimal>()
+            .map(Value::Numeric)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Bignumeric | TableFieldType::Bigdecimal => s
+            .parse::<rust_decimal::Decimal>()
+            .map(Value::Numeric)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Json => serde_json::from_str(s)
+            .map(Value::Json)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+        TableFieldType::Record | TableFieldType::Struct => Value::String(s.to_string()),
+        TableFieldType::Interval => Value::String(s.to_string()),
     }
 }
