@@ -1,5 +1,7 @@
 # Rust
 /target/
+/vendor/
+/.cargo/
 Cargo.lock
 
 # Editor/Tool caches
