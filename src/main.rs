@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 mod error;
 mod executor;
+mod loader;
 mod rpc;
 mod session;
 mod utils;

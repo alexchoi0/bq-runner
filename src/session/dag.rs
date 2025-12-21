@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::executor::{Executor, ExecutorMode};
+use crate::loader::SqlFile;
 use crate::rpc::types::{ColumnDef, DagTableDef, DagTableDetail, DagTableInfo};
 use crate::utils::{json_to_sql_value, value_to_sql};
 
@@ -108,6 +109,31 @@ impl Dag {
         Self {
             tables: HashMap::new(),
         }
+    }
+
+    pub fn from_sql_files(files: Vec<SqlFile>) -> Self {
+        let mut tables = HashMap::new();
+
+        for file in &files {
+            let table = DagTable {
+                name: file.name.clone(),
+                sql: Some(file.sql.clone()),
+                schema: None,
+                rows: Vec::new(),
+                dependencies: Vec::new(),
+                is_source: false,
+            };
+            tables.insert(file.name.clone(), table);
+        }
+
+        for file in &files {
+            let deps = extract_dependencies(&file.sql, &tables);
+            if let Some(table) = tables.get_mut(&file.name) {
+                table.dependencies = deps;
+            }
+        }
+
+        Self { tables }
     }
 
     pub fn register(&mut self, defs: Vec<DagTableDef>) -> Result<Vec<DagTableInfo>> {
