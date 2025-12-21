@@ -2,8 +2,8 @@ mod bigquery;
 mod yachtsql;
 
 pub use self::bigquery::BigQueryExecutor;
-pub use self::yachtsql::QueryResult;
-pub use self::yachtsql::YachtSqlExecutor;
+pub use self::yachtsql::{QueryResult, ColumnInfo, YachtSqlExecutor};
+pub use crate::rpc::types::ColumnDef;
 
 use crate::error::Result;
 
@@ -20,6 +20,14 @@ pub enum Executor {
 }
 
 impl Executor {
+    pub fn mock() -> Result<Self> {
+        Ok(Self::Mock(YachtSqlExecutor::new()?))
+    }
+
+    pub async fn bigquery() -> Result<Self> {
+        Ok(Self::BigQuery(BigQueryExecutor::new().await?))
+    }
+
     pub fn mode(&self) -> ExecutorMode {
         match self {
             Executor::Mock(_) => ExecutorMode::Mock,
@@ -27,25 +35,39 @@ impl Executor {
         }
     }
 
-    pub fn execute_query(&self, sql: &str) -> Result<QueryResult> {
+    pub fn is_mock(&self) -> bool {
+        matches!(self, Executor::Mock(_))
+    }
+
+    pub fn query(&self, sql: &str) -> Result<QueryResult> {
         match self {
             Executor::Mock(e) => e.execute_query(sql),
             Executor::BigQuery(e) => e.execute_query(sql),
         }
     }
 
-    pub fn execute_statement(&self, sql: &str) -> Result<u64> {
+    pub fn execute(&self, sql: &str) -> Result<u64> {
         match self {
             Executor::Mock(e) => e.execute_statement(sql),
             Executor::BigQuery(e) => e.execute_statement(sql),
         }
     }
 
+    #[deprecated(note = "use query() instead")]
+    pub fn execute_query(&self, sql: &str) -> Result<QueryResult> {
+        self.query(sql)
+    }
+
+    #[deprecated(note = "use execute() instead")]
+    pub fn execute_statement(&self, sql: &str) -> Result<u64> {
+        self.execute(sql)
+    }
+
     pub fn load_parquet(
         &self,
         table_name: &str,
         path: &str,
-        schema: &[crate::rpc::types::ColumnDef],
+        schema: &[ColumnDef],
     ) -> Result<u64> {
         match self {
             Executor::Mock(e) => e.load_parquet(table_name, path, schema),
