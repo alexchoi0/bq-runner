@@ -129,8 +129,8 @@ impl YachtSqlExecutor {
             .rows
             .into_iter()
             .map(|row| {
-                let name = row[0].as_str().unwrap_or("").to_string();
-                let row_count = row[1].as_i64().unwrap_or(0) as u64;
+                let name = row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let row_count = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u64;
                 (name, row_count)
             })
             .collect();
@@ -149,8 +149,8 @@ impl YachtSqlExecutor {
             .rows
             .into_iter()
             .map(|row| {
-                let name = row[0].as_str().unwrap_or("").to_string();
-                let col_type = row[1].as_str().unwrap_or("STRING").to_string();
+                let name = row.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let col_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("STRING").to_string();
                 (name, col_type)
             })
             .collect();
@@ -160,7 +160,7 @@ impl YachtSqlExecutor {
         let row_count = count_result
             .rows
             .first()
-            .and_then(|row| row.first())
+            .and_then(|row| row.get(0))
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as u64;
 

@@ -9,7 +9,7 @@ use google_cloud_bigquery::http::table::{
 };
 use google_cloud_bigquery::http::tabledata::list::Value as BqValue;
 use tokio::runtime::Handle;
-use yachtsql::Value;
+use yachtsql::{Row, Value};
 
 use crate::error::{Error, Result};
 use crate::rpc::types::ColumnDef;
@@ -199,17 +199,18 @@ impl BigQueryExecutor {
             })
             .unwrap_or_default();
 
-        let rows: Vec<Vec<Value>> = response
+        let rows: Vec<Row> = response
             .rows
             .unwrap_or_default()
             .into_iter()
             .map(|tuple| {
-                tuple
+                let values: Vec<Value> = tuple
                     .f
                     .into_iter()
                     .zip(field_types.iter())
                     .map(|(cell, field_type)| bq_value_to_yachtsql(cell.v, field_type))
-                    .collect()
+                    .collect();
+                Row::new(values)
             })
             .collect();
 
