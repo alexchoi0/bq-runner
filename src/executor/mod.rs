@@ -21,8 +21,8 @@ pub enum Executor {
 
 impl Executor {
     #[allow(dead_code)]
-    pub fn mock() -> Self {
-        Self::Mock(YachtSqlExecutor::new())
+    pub fn mock() -> Result<Self> {
+        Ok(Self::Mock(YachtSqlExecutor::new()))
     }
 
     #[allow(dead_code)]
